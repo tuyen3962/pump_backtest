@@ -1,0 +1,16 @@
+.git
+.gitignore
+bin
+data
+webapp/node_modules
+webapp/dist
+web/dist
+**/*_test.go
+**/.DS_Store
+**/.env
+**/.env.*
+!.env.example
+deploy/*.md
+agent-transcripts
+.cursor
+*.ndjson

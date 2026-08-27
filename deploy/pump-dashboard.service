@@ -1,0 +1,22 @@
+[Unit]
+Description=Pump Backtest Dashboard
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=pump
+Group=pump
+WorkingDirectory=/opt/pump_backtest
+EnvironmentFile=-/etc/pump-backtest.env
+ExecStart=/opt/pump_backtest/bin/dashboard -addr 0.0.0.0:8080 -data /opt/pump_backtest/data/signals
+Restart=on-failure
+RestartSec=3
+LimitNOFILE=65535
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/opt/pump_backtest/data
+
+[Install]
+WantedBy=multi-user.target

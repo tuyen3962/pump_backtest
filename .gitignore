@@ -1,0 +1,23 @@
+# Recorded signal dumps (keep for local backtest)
+data/signals/*.ndjson
+data/signals/*.jsonl
+
+# Go
+*.exe
+*.test
+/bin/
+/dist/
+data/signals/debug_*.ndjson
+
+# Node / React
+webapp/node_modules/
+webapp/dist/
+
+# IDE / OS
+.idea/
+.vscode/
+.DS_Store
+*.swp
+.env
+.env.*
+!.env.example

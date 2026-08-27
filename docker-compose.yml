@@ -1,0 +1,29 @@
+services:
+  dashboard:
+    build: .
+    image: pump-backtest:latest
+    container_name: pump-dashboard
+    restart: unless-stopped
+    ports:
+      - "${DASHBOARD_PORT:-8080}:8080"
+    volumes:
+      - signal_data:/app/data
+    environment:
+      - TZ=${TZ:-Asia/Ho_Chi_Minh}
+    command: ["-addr", "0.0.0.0:8080", "-data", "/app/data/signals"]
+
+  signal-recorder:
+    image: pump-backtest:latest
+    container_name: pump-signal-recorder
+    restart: unless-stopped
+    volumes:
+      - signal_data:/app/data
+    environment:
+      - TZ=${TZ:-Asia/Ho_Chi_Minh}
+    entrypoint: ["/app/signal-recorder"]
+    command: ["-out", "/app/data/signals", "-channel", "signals"]
+    depends_on:
+      - dashboard
+
+volumes:
+  signal_data:
