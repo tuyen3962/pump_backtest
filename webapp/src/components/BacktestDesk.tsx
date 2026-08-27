@@ -1,5 +1,7 @@
 import { useEffect, useMemo, useState } from "react";
 import {
+  enqueueBacktest,
+  fetchJob,
   fetchLastBacktest,
   fetchRun,
   fetchSources,
@@ -19,6 +21,12 @@ function sol(n: number | undefined | null, digits = 4): string {
   const v = Number(n ?? 0);
   const sign = v < 0 ? "-" : "";
   return `${sign}${Math.abs(v).toFixed(digits)} SOL`;
+}
+
+/** datetime-local value in local TZ */
+function toLocalInput(d: Date): string {
+  const pad = (n: number) => String(n).padStart(2, "0");
+  return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}T${pad(d.getHours())}:${pad(d.getMinutes())}`;
 }
 
 type Props = {
@@ -46,6 +54,12 @@ export function BacktestDesk({ onRunComplete, onDraftChange, liveByMint, loadRun
   const [enrich, setEnrich] = useState(true);
   const [sampleLive, setSampleLive] = useState(false);
   const [disableFilters, setDisableFilters] = useState(false);
+  const [fromTime, setFromTime] = useState("");
+  const [toTime, setToTime] = useState("");
+  const [sessionEndAt, setSessionEndAt] = useState("");
+  const [sessionRefreshSec, setSessionRefreshSec] = useState(60);
+  const [sessionJobId, setSessionJobId] = useState<string | null>(null);
+  const [sessionProgress, setSessionProgress] = useState("");
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState("");
   const [savedAt, setSavedAt] = useState("");
@@ -73,6 +87,10 @@ export function BacktestDesk({ onRunComplete, onDraftChange, liveByMint, loadRun
       disableFilters,
       exitMustOut: true,
       exitWatchOut: false,
+      fromTime: fromTime || undefined,
+      toTime: toTime || undefined,
+      sessionEndAt: sessionEndAt || undefined,
+      sessionRefreshSec: sessionRefreshSec || undefined,
     }),
     [
       source,
@@ -91,6 +109,10 @@ export function BacktestDesk({ onRunComplete, onDraftChange, liveByMint, loadRun
       stopLoss,
       takeProfit,
       disableFilters,
+      fromTime,
+      toTime,
+      sessionEndAt,
+      sessionRefreshSec,
     ],
   );
 
@@ -145,6 +167,33 @@ export function BacktestDesk({ onRunComplete, onDraftChange, liveByMint, loadRun
     })();
   }, [loadRunId]);
 
+  // Poll stability session job + refresh run snapshot
+  useEffect(() => {
+    if (!sessionJobId) return;
+    const t = setInterval(() => {
+      void (async () => {
+        try {
+          const job = await fetchJob(sessionJobId);
+          setSessionProgress(job.progress || job.status);
+          if (job.runId) {
+            const packed = await fetchRun(job.runId);
+            setData(packed.run);
+            setSavedAt(packed.savedAt || packed.run.updated || "");
+          }
+          if (job.status === "done" || job.status === "failed" || job.status === "cancelled") {
+            setSessionJobId(null);
+            setLoading(false);
+            if (job.status === "failed") setError(job.error || "session failed");
+            else onRunComplete?.();
+          }
+        } catch (err) {
+          setError(String((err as Error).message || err));
+        }
+      })();
+    }, 3000);
+    return () => clearInterval(t);
+  }, [sessionJobId, onRunComplete]);
+
   const result = data?.result;
   const liveBook = useMemo(() => {
     if (!result) return null;
@@ -155,7 +204,8 @@ export function BacktestDesk({ onRunComplete, onDraftChange, liveByMint, loadRun
     let liveMarks = 0;
     for (const c of result.coins || []) {
       if (!c.open) continue;
-      const rem = c.remaining && c.remaining > 0 ? c.remaining : 1;
+      const rem =
+        c.remaining != null && c.remaining > 0 && c.remaining <= 1 ? c.remaining : 1;
       const live = liveByMint?.[c.mint];
       if (live?.liveMcap != null && c.entryMcap > 0) {
         openUnreal += notional * rem * ((live.liveMcap - c.entryMcap) / c.entryMcap);
@@ -203,13 +253,54 @@ export function BacktestDesk({ onRunComplete, onDraftChange, liveByMint, loadRun
     setLoading(true);
     setError("");
     try {
-      const res = await runBacktest({ ...draft, async: false, updateWatchlist: true });
+      const res = await runBacktest({
+        ...draft,
+        sessionEndAt: undefined,
+        async: false,
+        updateWatchlist: true,
+      });
       setData(res);
       setSavedAt(res.updated || new Date().toISOString());
       onRunComplete?.();
     } catch (err) {
       setError(String((err as Error).message || err));
     } finally {
+      setLoading(false);
+    }
+  }
+
+  async function startSession() {
+    if (!entryKinds.length) {
+      setError("Chọn ít nhất 1 entry kind");
+      return;
+    }
+    if (!sessionEndAt) {
+      setError("Chọn giờ kết thúc session");
+      return;
+    }
+    const end = new Date(sessionEndAt);
+    if (Number.isNaN(end.getTime()) || end.getTime() <= Date.now()) {
+      setError("Giờ kết thúc phải sau hiện tại");
+      return;
+    }
+    setLoading(true);
+    setError("");
+    try {
+      const start = fromTime || toLocalInput(new Date());
+      if (!fromTime) setFromTime(start);
+      const { job } = await enqueueBacktest({
+        ...draft,
+        fromTime: start,
+        toTime: undefined,
+        sessionEndAt,
+        sessionRefreshSec: sessionRefreshSec || 60,
+        label: runLabel.trim() || `session → ${end.toLocaleTimeString()}`,
+        updateWatchlist: true,
+      });
+      setSessionJobId(job.id);
+      setSessionProgress(job.progress || job.status);
+    } catch (err) {
+      setError(String((err as Error).message || err));
       setLoading(false);
     }
   }
@@ -254,6 +345,42 @@ export function BacktestDesk({ onRunComplete, onDraftChange, liveByMint, loadRun
               </label>
             ))}
           </div>
+
+          <label htmlFor="fromTime">Từ lúc (signal window)</label>
+          <input
+            id="fromTime"
+            type="datetime-local"
+            value={fromTime}
+            onChange={(e) => setFromTime(e.target.value)}
+          />
+          <label htmlFor="toTime">Đến lúc (để trống = hết file)</label>
+          <input
+            id="toTime"
+            type="datetime-local"
+            value={toTime}
+            onChange={(e) => setToTime(e.target.value)}
+          />
+          <p className="panel-note" style={{ marginTop: 4 }}>
+            Sync: cắt slice lịch sử theo cửa sổ. Session: bắt đầu từ lúc chạy → giờ kết thúc,
+            reload tín hiệu định kỳ để theo dõi ổn định.
+          </p>
+
+          <label htmlFor="sessionEnd">Kết thúc session</label>
+          <input
+            id="sessionEnd"
+            type="datetime-local"
+            value={sessionEndAt}
+            onChange={(e) => setSessionEndAt(e.target.value)}
+          />
+          <label htmlFor="sessionRefresh">Refresh session (giây)</label>
+          <input
+            id="sessionRefresh"
+            type="number"
+            value={sessionRefreshSec}
+            min={30}
+            step={30}
+            onChange={(e) => setSessionRefreshSec(Number(e.target.value))}
+          />
 
           <label htmlFor="startCash">Bankroll (SOL)</label>
           <input
@@ -315,40 +442,6 @@ export function BacktestDesk({ onRunComplete, onDraftChange, liveByMint, loadRun
             onChange={(e) => setFeeBps(Number(e.target.value))}
           />
 
-          <label htmlFor="minLiq">Min liquidity ($)</label>
-          <input
-            id="minLiq"
-            type="number"
-            value={minLiq}
-            min={0}
-            step={500}
-            onChange={(e) => setMinLiq(Number(e.target.value))}
-          />
-
-          <label htmlFor="minVol1h">Min vol 1h ($)</label>
-          <input
-            id="minVol1h"
-            type="number"
-            value={minVol1h}
-            min={0}
-            step={500}
-            onChange={(e) => setMinVol1h(Number(e.target.value))}
-          />
-
-          <label htmlFor="maxPos">Max concurrent (0 = chỉ giới hạn bankroll)</label>
-          <input
-            id="maxPos"
-            type="number"
-            value={maxPos}
-            min={0}
-            step={1}
-            onChange={(e) => setMaxPos(Number(e.target.value))}
-          />
-          <p className="panel-note" style={{ marginTop: 4 }}>
-            Free cash ≥ size mới mở thêm · bankroll {startCash} / size {notional} → ~{" "}
-            {notional > 0 ? Math.floor(startCash / notional) : 0} lệnh đồng thời.
-          </p>
-
           <div className="checks" style={{ marginTop: 14 }}>
             <label>
               <input type="checkbox" checked={closeEod} onChange={(e) => setCloseEod(e.target.checked)} />
@@ -376,9 +469,22 @@ export function BacktestDesk({ onRunComplete, onDraftChange, liveByMint, loadRun
             </label>
           </div>
 
-          <button className="run" onClick={() => void run()} disabled={loading}>
-            {loading ? "Đang chạy…" : "Chạy backtest (sync)"}
+          <button className="run" onClick={() => void run()} disabled={loading || !!sessionJobId}>
+            {loading && !sessionJobId ? "Đang chạy…" : "Chạy backtest (sync)"}
           </button>
+          <button
+            className="run"
+            style={{ marginTop: 8 }}
+            onClick={() => void startSession()}
+            disabled={loading || !!sessionJobId}
+          >
+            {sessionJobId ? "Session đang chạy…" : "Bắt đầu session → giờ kết thúc"}
+          </button>
+          {sessionJobId ? (
+            <p className="panel-note" style={{ marginTop: 8 }}>
+              {sessionProgress || "session…"}
+            </p>
+          ) : null}
           {error ? <div className="err">{error}</div> : null}
         </aside>
 

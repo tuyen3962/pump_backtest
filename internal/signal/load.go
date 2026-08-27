@@ -79,6 +79,26 @@ func LoadNDJSON(paths ...string) ([]Record, error) {
 	return out, nil
 }
 
+// FilterTimeRange keeps records with EventTime in [from, to] (inclusive).
+// Zero from/to means open-ended on that side.
+func FilterTimeRange(recs []Record, from, to time.Time) []Record {
+	if from.IsZero() && to.IsZero() {
+		return recs
+	}
+	out := make([]Record, 0, len(recs))
+	for _, r := range recs {
+		t := r.EventTime()
+		if !from.IsZero() && t.Before(from) {
+			continue
+		}
+		if !to.IsZero() && t.After(to) {
+			continue
+		}
+		out = append(out, r)
+	}
+	return out
+}
+
 func loadFile(path string, seen map[string]struct{}) ([]Record, error) {
 	f, err := os.Open(path)
 	if err != nil {

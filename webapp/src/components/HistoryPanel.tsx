@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useState } from "react";
 import { fetchHistory, type HistoryEntry } from "../api";
 import { hold, pct, pnlClass, shortMint } from "../format";
+import { CopyMint } from "./CopyMint";
 
 export function HistoryPanel() {
   const [items, setItems] = useState<HistoryEntry[]>([]);
@@ -75,8 +76,13 @@ export function HistoryPanel() {
                 return (
                   <tr key={c.id || `${c.mint}-${c.closedAt}-${c.exitReason}-${c.holdSec}`}>
                     <td>
-                      <strong>{c.symbol || "?"}</strong>
-                      <div className="mint">{shortMint(c.mint, 6, 6)}</div>
+                      <div className="coin-cell">
+                        <strong>{c.symbol || "?"}</strong>
+                        <CopyMint mint={c.mint} />
+                      </div>
+                      <div className="mint" title={c.mint}>
+                        {shortMint(c.mint, 6, 6)}
+                      </div>
                     </td>
                     <td>
                       <span className={`pill ${statusCls}`}>{c.status}</span>

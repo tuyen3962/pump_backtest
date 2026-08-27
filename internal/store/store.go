@@ -196,6 +196,76 @@ func (s *Store) ListRuns(limit int) ([]RunSummary, error) {
 	return out, nil
 }
 
+func (s *Store) DeleteRun(id string) error {
+	id = strings.TrimSpace(filepath.Base(id))
+	if id == "" {
+		return os.ErrNotExist
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	path := filepath.Join(s.Root, "runs", "run_"+id+".json")
+	if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
+		return err
+	}
+	lastPath := filepath.Join(s.Root, "runs", "last.json")
+	b, err := os.ReadFile(lastPath)
+	if err == nil {
+		var run SavedRun
+		if json.Unmarshal(b, &run) == nil && run.ID == id {
+			_ = os.Remove(lastPath)
+		}
+	}
+	return nil
+}
+
+// DeleteRunsBefore removes archived runs with SavedAt strictly before cutoff.
+func (s *Store) DeleteRunsBefore(cutoff time.Time) (int, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	dir := filepath.Join(s.Root, "runs")
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return 0, nil
+		}
+		return 0, err
+	}
+	n := 0
+	var lastID string
+	if b, err := os.ReadFile(filepath.Join(dir, "last.json")); err == nil {
+		var last SavedRun
+		if json.Unmarshal(b, &last) == nil {
+			lastID = last.ID
+		}
+	}
+	for _, e := range entries {
+		name := e.Name()
+		if e.IsDir() || !strings.HasPrefix(name, "run_") || !strings.HasSuffix(name, ".json") {
+			continue
+		}
+		p := filepath.Join(dir, name)
+		b, err := os.ReadFile(p)
+		if err != nil {
+			continue
+		}
+		var run SavedRun
+		if err := json.Unmarshal(b, &run); err != nil {
+			continue
+		}
+		if run.SavedAt.IsZero() || !run.SavedAt.Before(cutoff) {
+			continue
+		}
+		if err := os.Remove(p); err != nil {
+			continue
+		}
+		n++
+		if run.ID == lastID {
+			_ = os.Remove(filepath.Join(dir, "last.json"))
+		}
+	}
+	return n, nil
+}
+
 func (s *Store) AppendHistory(entries []HistoryEntry) error {
 	if len(entries) == 0 {
 		return nil

@@ -116,6 +116,40 @@ func (r *Runner) SetProgress(id, msg string) {
 	}
 }
 
+// SetRunID updates the linked run id while a long session job is still running.
+func (r *Runner) SetRunID(id, runID string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if j, ok := r.jobs[id]; ok {
+		j.RunID = runID
+	}
+}
+
+// Cancel stops a queued or running job. Returns false if missing or already finished.
+func (r *Runner) Cancel(id string) bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	j, ok := r.jobs[id]
+	if !ok {
+		return false
+	}
+	switch j.Status {
+	case StatusQueued:
+		j.Status = StatusCancelled
+		j.FinishedAt = time.Now().UTC()
+		j.Error = "cancelled"
+		j.Progress = ""
+		return true
+	case StatusRunning:
+		if cancel, ok := r.cancel[id]; ok {
+			cancel()
+		}
+		return true
+	default:
+		return false
+	}
+}
+
 func (r *Runner) loop() {
 	for id := range r.queue {
 		r.mu.Lock()

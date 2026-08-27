@@ -202,11 +202,13 @@ func handleBacktest(w http.ResponseWriter, r *http.Request, hub *backtestHub) {
 		http.Error(w, "bad json: "+err.Error(), http.StatusBadRequest)
 		return
 	}
-	async := req.Async || r.URL.Query().Get("async") == "1"
+	// Stability sessions always run async (periodic reload until SessionEndAt).
+	async := req.Async || r.URL.Query().Get("async") == "1" || strings.TrimSpace(req.SessionEndAt) != ""
 	if async {
 		// Compare/lab runs should not clobber the live follow watchlist.
+		// Session jobs default to updating watchlist so Live Follow tracks opens.
 		if req.UpdateWatchlist == nil {
-			f := false
+			f := strings.TrimSpace(req.SessionEndAt) != ""
 			req.UpdateWatchlist = &f
 		}
 		job, err := hub.enqueue(req, reqBytes)
@@ -222,7 +224,7 @@ func handleBacktest(w http.ResponseWriter, r *http.Request, hub *backtestHub) {
 	if req.UpdateWatchlist != nil {
 		updateWatch = *req.UpdateWatchlist
 	}
-	out, err := hub.execute(r.Context(), req, reqBytes, "", updateWatch)
+	out, err := hub.execute(r.Context(), req, reqBytes, "", updateWatch, persistFull)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
@@ -239,35 +241,61 @@ func handleJobs(w http.ResponseWriter, r *http.Request, hub *backtestHub) {
 }
 
 func handleJobByID(w http.ResponseWriter, r *http.Request, hub *backtestHub) {
-	if r.Method != http.MethodGet {
-		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
-		return
-	}
 	id := strings.TrimPrefix(r.URL.Path, "/api/jobs/")
 	id = filepath.Base(id)
-	job, ok := hub.runner.Get(id)
-	if !ok {
-		http.Error(w, "job not found", http.StatusNotFound)
-		return
+	switch r.Method {
+	case http.MethodGet:
+		job, ok := hub.runner.Get(id)
+		if !ok {
+			http.Error(w, "job not found", http.StatusNotFound)
+			return
+		}
+		writeJSON(w, job)
+	case http.MethodDelete:
+		ok := hub.runner.Cancel(id)
+		if !ok {
+			http.Error(w, "job not found or not cancellable", http.StatusNotFound)
+			return
+		}
+		writeJSON(w, map[string]any{"ok": true, "id": id})
+	default:
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 	}
-	writeJSON(w, job)
 }
 
 func handleRuns(w http.ResponseWriter, r *http.Request, st *store.Store) {
-	if r.Method != http.MethodGet {
+	switch r.Method {
+	case http.MethodGet:
+		if r.URL.Query().Get("compare") != "" {
+			handleCompareRuns(w, r, st)
+			return
+		}
+		items, err := st.ListRuns(100)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		writeJSON(w, map[string]any{"items": items, "count": len(items)})
+	case http.MethodDelete:
+		before := strings.TrimSpace(r.URL.Query().Get("before"))
+		if before == "" {
+			http.Error(w, "before=RFC3339 required", http.StatusBadRequest)
+			return
+		}
+		cutoff, err := parseRFC3339(before)
+		if err != nil || cutoff.IsZero() {
+			http.Error(w, "bad before time", http.StatusBadRequest)
+			return
+		}
+		n, err := st.DeleteRunsBefore(cutoff)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		writeJSON(w, map[string]any{"deleted": n, "before": cutoff.UTC().Format(time.RFC3339)})
+	default:
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
-		return
 	}
-	if r.URL.Query().Get("compare") != "" {
-		handleCompareRuns(w, r, st)
-		return
-	}
-	items, err := st.ListRuns(100)
-	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
-		return
-	}
-	writeJSON(w, map[string]any{"items": items, "count": len(items)})
 }
 
 func handleCompareRuns(w http.ResponseWriter, r *http.Request, st *store.Store) {
@@ -385,6 +413,15 @@ func handleRunByID(w http.ResponseWriter, r *http.Request, st *store.Store) {
 				return backtest.WriteTradesCSV(w, res)
 			}
 		})
+		return
+	}
+
+	if r.Method == http.MethodDelete {
+		if err := st.DeleteRun(id); err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		writeJSON(w, map[string]any{"ok": true, "id": id})
 		return
 	}
 

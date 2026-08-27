@@ -1,6 +1,7 @@
 import { removeWatch, type FollowRow } from "../api";
 import { moneyCompact, pct, pnlClass, shortMint } from "../format";
 import type { FollowStreamState } from "../hooks/useFollowStream";
+import { CopyMint } from "./CopyMint";
 
 type Props = {
   stream: FollowStreamState;
@@ -54,7 +55,10 @@ export function LiveFollow({ stream }: Props) {
                 return (
                   <tr key={c.mint}>
                     <td>
-                      <strong>{c.symbol || "?"}</strong>
+                      <div className="coin-cell">
+                        <strong>{c.symbol || "?"}</strong>
+                        <CopyMint mint={c.mint} />
+                      </div>
                       <div className="mint" title={c.mint}>
                         {shortMint(c.mint, 6, 6)}
                       </div>

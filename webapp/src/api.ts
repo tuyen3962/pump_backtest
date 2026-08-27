@@ -131,6 +131,14 @@ export type BacktestRequest = {
   disableFilters?: boolean;
   async?: boolean;
   updateWatchlist?: boolean;
+  /** RFC3339 or datetime-local — filter signals from this time */
+  fromTime?: string;
+  /** RFC3339 or datetime-local — filter signals until this time */
+  toTime?: string;
+  /** RFC3339 or datetime-local — keep re-running live session until this time */
+  sessionEndAt?: string;
+  /** Refresh interval seconds during session (default 60) */
+  sessionRefreshSec?: number;
 };
 
 export type RunSummary = {
@@ -253,8 +261,18 @@ export async function enqueueBacktest(body: BacktestRequest): Promise<{ job: Job
   const res = await fetch("/api/backtest", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ ...body, async: true, updateWatchlist: false }),
+    body: JSON.stringify({
+      ...body,
+      async: true,
+      updateWatchlist: body.updateWatchlist ?? false,
+    }),
   });
+  if (!res.ok) throw new Error(await readError(res));
+  return res.json();
+}
+
+export async function cancelJob(id: string): Promise<{ ok: boolean }> {
+  const res = await fetch(`/api/jobs/${encodeURIComponent(id)}`, { method: "DELETE" });
   if (!res.ok) throw new Error(await readError(res));
   return res.json();
 }
@@ -273,6 +291,18 @@ export async function fetchJob(id: string): Promise<JobStatus> {
 
 export async function fetchRuns(): Promise<{ items: RunSummary[]; count: number }> {
   const res = await fetch("/api/runs");
+  if (!res.ok) throw new Error(await readError(res));
+  return res.json();
+}
+
+export async function deleteRun(id: string): Promise<{ ok: boolean }> {
+  const res = await fetch(`/api/runs/${encodeURIComponent(id)}`, { method: "DELETE" });
+  if (!res.ok) throw new Error(await readError(res));
+  return res.json();
+}
+
+export async function pruneRunsBefore(beforeIso: string): Promise<{ deleted: number; before: string }> {
+  const res = await fetch(`/api/runs?before=${encodeURIComponent(beforeIso)}`, { method: "DELETE" });
   if (!res.ok) throw new Error(await readError(res));
   return res.json();
 }

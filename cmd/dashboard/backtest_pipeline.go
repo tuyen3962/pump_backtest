@@ -42,7 +42,23 @@ type backtestRequest struct {
 	Async           bool     `json:"async"`
 	// UpdateWatchlist: when false (async compare runs), skip mutating follow watchlist.
 	UpdateWatchlist *bool `json:"updateWatchlist"`
+
+	// FromTime / ToTime: RFC3339 window filter on signal EventTime (historical slice).
+	FromTime string `json:"fromTime"`
+	ToTime   string `json:"toTime"`
+	// SessionEndAt: RFC3339 — if set with async, keep re-running until this time.
+	SessionEndAt string `json:"sessionEndAt"`
+	// SessionRefreshSec: how often to reload live signals during a session (default 60).
+	SessionRefreshSec int `json:"sessionRefreshSec"`
 }
+
+type persistKind int
+
+const (
+	persistFull persistKind = iota
+	// persistSnapshot: overwrite run + optional watchlist; skip history append spam.
+	persistSnapshot
+)
 
 type backtestOutcome struct {
 	RunID   string
@@ -88,23 +104,99 @@ func (h *backtestHub) runJob(ctx context.Context, job *jobs.Job) error {
 		h.mu.Unlock()
 	}()
 
-	h.runner.SetProgress(job.ID, "loading signals")
-	out, err := h.execute(ctx, p.Req, p.ReqBytes, job.ID, false)
-	if err != nil {
-		return err
+	req := p.Req
+	endAt, _ := parseRFC3339(req.SessionEndAt)
+	if endAt.IsZero() {
+		updateWatch := false
+		if req.UpdateWatchlist != nil {
+			updateWatch = *req.UpdateWatchlist
+		}
+		h.runner.SetProgress(job.ID, "loading signals")
+		out, err := h.execute(ctx, req, p.ReqBytes, job.ID, updateWatch, persistFull)
+		if err != nil {
+			return err
+		}
+		job.RunID = out.RunID
+		h.runner.SetRunID(job.ID, out.RunID)
+		if job.Label == "" {
+			job.Label = req.Label
+		}
+		h.runner.SetProgress(job.ID, "done")
+		return nil
 	}
-	job.RunID = out.RunID
-	if job.Label == "" {
-		job.Label = p.Req.Label
+
+	// Live stability session: from now (or FromTime) until SessionEndAt.
+	if strings.TrimSpace(req.FromTime) == "" {
+		req.FromTime = time.Now().UTC().Format(time.RFC3339)
 	}
-	h.runner.SetProgress(job.ID, "done")
-	return nil
+	refresh := req.SessionRefreshSec
+	if refresh < 30 {
+		refresh = 60
+	}
+	updateWatch := true
+	if req.UpdateWatchlist != nil {
+		updateWatch = *req.UpdateWatchlist
+	}
+
+	for {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		now := time.Now().UTC()
+		final := !now.Before(endAt)
+		tick := req
+		if final {
+			tick.ToTime = endAt.UTC().Format(time.RFC3339)
+			tick.CloseOpenAtEnd = true
+		} else {
+			tick.ToTime = now.Format(time.RFC3339)
+			tick.CloseOpenAtEnd = false
+		}
+		h.runner.SetProgress(job.ID, fmt.Sprintf("session → %s · tick %s · signals reload",
+			endAt.Local().Format("15:04"), now.Local().Format("15:04:05")))
+
+		mode := persistSnapshot
+		if final {
+			mode = persistFull
+		}
+		out, err := h.execute(ctx, tick, p.ReqBytes, job.ID, updateWatch, mode)
+		if err != nil {
+			return err
+		}
+		job.RunID = out.RunID
+		h.runner.SetRunID(job.ID, out.RunID)
+		if job.Label == "" {
+			job.Label = req.Label
+		}
+		if final {
+			h.runner.SetProgress(job.ID, "session complete")
+			return nil
+		}
+		sleep := time.Duration(refresh) * time.Second
+		if now.Add(sleep).After(endAt) {
+			sleep = time.Until(endAt)
+			if sleep < time.Second {
+				sleep = time.Second
+			}
+		}
+		timer := time.NewTimer(sleep)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return ctx.Err()
+		case <-timer.C:
+		}
+	}
 }
 
 func (h *backtestHub) enqueue(req backtestRequest, reqBytes []byte) (*jobs.Job, error) {
 	id := newRunID()
 	if req.Label == "" {
-		req.Label = "run " + id
+		if req.SessionEndAt != "" {
+			req.Label = "session " + id
+		} else {
+			req.Label = "run " + id
+		}
 	}
 	h.mu.Lock()
 	h.pending[id] = jobPayload{ReqBytes: reqBytes, Req: req}
@@ -119,12 +211,16 @@ func (h *backtestHub) enqueue(req backtestRequest, reqBytes []byte) (*jobs.Job, 
 	return job, nil
 }
 
-func (h *backtestHub) execute(ctx context.Context, req backtestRequest, reqBytes []byte, preferredID string, updateWatchlist bool) (*backtestOutcome, error) {
+func (h *backtestHub) execute(ctx context.Context, req backtestRequest, reqBytes []byte, preferredID string, updateWatchlist bool, persist persistKind) (*backtestOutcome, error) {
 	path := resolveSourcePath(h.dataDir, req.Source)
 	records, err := signal.LoadNDJSON(path)
 	if err != nil {
 		return nil, fmt.Errorf("load: %w", err)
 	}
+	from, _ := parseRFC3339(req.FromTime)
+	to, _ := parseRFC3339(req.ToTime)
+	before := len(records)
+	records = signal.FilterTimeRange(records, from, to)
 
 	cfg := buildConfig(req)
 	var market map[string]backtest.MarketSnapshot
@@ -159,6 +255,10 @@ func (h *backtestHub) execute(ctx context.Context, req backtestRequest, reqBytes
 		"label":   req.Label,
 		"source":  path,
 		"loaded":  len(records),
+		"loadedAll": before,
+		"fromTime":  req.FromTime,
+		"toTime":    req.ToTime,
+		"sessionEndAt": req.SessionEndAt,
 		"result":  res,
 		"equity":  equityDTO(res),
 		"updated": time.Now().UTC().Format(time.RFC3339),
@@ -188,13 +288,60 @@ func (h *backtestHub) execute(ctx context.Context, req backtestRequest, reqBytes
 		log.Printf("save run %s: %v", runID, err)
 	}
 
-	if updateWatchlist {
-		persistHistoryAndWatch(h.st, runID, res)
-	} else {
-		persistHistoryOnly(h.st, runID, res)
+	switch persist {
+	case persistSnapshot:
+		if updateWatchlist {
+			persistWatchOnly(h.st, res)
+		}
+	default:
+		if updateWatchlist {
+			persistHistoryAndWatch(h.st, runID, res)
+		} else {
+			persistHistoryOnly(h.st, runID, res)
+		}
 	}
 
 	return &backtestOutcome{RunID: runID, Payload: payload, Result: res, Path: path}, nil
+}
+
+func parseRFC3339(s string) (time.Time, error) {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return time.Time{}, nil
+	}
+	if t, err := time.Parse(time.RFC3339, s); err == nil {
+		return t.UTC(), nil
+	}
+	// datetime-local from browsers: 2026-08-27T21:00
+	if t, err := time.ParseInLocation("2006-01-02T15:04", s, time.Local); err == nil {
+		return t.UTC(), nil
+	}
+	if t, err := time.ParseInLocation("2006-01-02T15:04:05", s, time.Local); err == nil {
+		return t.UTC(), nil
+	}
+	return time.Time{}, fmt.Errorf("bad time %q", s)
+}
+
+func persistWatchOnly(st *store.Store, res backtest.Result) {
+	now := time.Now().UTC()
+	var openWatch []store.WatchItem
+	seenOpen := map[string]bool{}
+	for _, c := range res.Coins {
+		if !c.Open || c.Mint == "" || seenOpen[c.Mint] {
+			continue
+		}
+		seenOpen[c.Mint] = true
+		openWatch = append(openWatch, store.WatchItem{
+			Mint:      c.Mint,
+			Symbol:    c.Symbol,
+			EntryMcap: c.EntryMcap,
+			AddedAt:   now,
+			Source:    "backtest_open",
+		})
+	}
+	if _, err := st.ReplaceSourceWatches("backtest_open", openWatch); err != nil {
+		log.Printf("watchlist sync: %v", err)
+	}
 }
 
 func resolveSourcePath(dataDir, source string) string {
