@@ -3,8 +3,10 @@
 # --- frontend ---
 FROM node:22-bookworm-slim AS web
 WORKDIR /src/webapp
-COPY webapp/package.json webapp/package-lock.json ./
-RUN npm ci
+COPY webapp/package.json ./
+# lockfile optional (may be missing if global gitignore excluded it)
+COPY webapp/package-lock.json* ./
+RUN if [ -f package-lock.json ]; then npm ci; else npm install; fi
 COPY webapp/ ./
 RUN npm run build
 
