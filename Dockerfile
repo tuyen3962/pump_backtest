@@ -24,14 +24,14 @@ RUN CGO_ENABLED=0 GOOS=linux go build -trimpath -ldflags="-s -w" -o /out/dashboa
  && CGO_ENABLED=0 GOOS=linux go build -trimpath -ldflags="-s -w" -o /out/token-info ./cmd/token-info
 
 # --- runtime ---
-FROM gcr.io/distroless/static-debian12:nonroot AS runtime
+# Run as root so Docker named volumes (/app/data) are writable on VPS.
+FROM gcr.io/distroless/static-debian12:latest AS runtime
 WORKDIR /app
 COPY --from=go-build /out/dashboard /app/dashboard
 COPY --from=go-build /out/signal-recorder /app/signal-recorder
 COPY --from=go-build /out/backtest /app/backtest
 COPY --from=go-build /out/token-info /app/token-info
 COPY testdata /app/testdata
-USER nonroot:nonroot
 EXPOSE 8080
 VOLUME ["/app/data"]
 ENTRYPOINT ["/app/dashboard"]

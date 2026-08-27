@@ -23,6 +23,9 @@ func main() {
 	dataDir := flag.String("data", "data/signals", "Default recordings directory")
 	flag.Parse()
 
+	if err := os.MkdirAll(*dataDir, 0o755); err != nil {
+		log.Fatalf("create data dir: %v", err)
+	}
 	static, err := fs.Sub(web.Dist, "dist")
 	if err != nil {
 		log.Fatal(err)
