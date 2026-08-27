@@ -627,10 +627,38 @@ func aggregateCoins(trades []Trade, stillOpen map[string]*position) []CoinStat {
 			continue
 		}
 		key := pos.entry.SignalID
-		if a, ok := m[key]; ok {
-			a.stat.Open = true
-			a.stat.Remaining = pos.remaining
+		if key == "" {
+			key = pos.entry.Mint + "|" + pos.entry.Time.String()
 		}
+		a, ok := m[key]
+		if !ok {
+			exitMcap := pos.lastMcap
+			if exitMcap <= 0 {
+				exitMcap = pos.entry.Mcap
+			}
+			ret := 0.0
+			if pos.entry.Mcap > 0 && exitMcap > 0 {
+				ret = (exitMcap - pos.entry.Mcap) / pos.entry.Mcap * 100
+			}
+			a = &agg{stat: CoinStat{
+				Mint:       pos.entry.Mint,
+				Symbol:     pos.entry.Symbol,
+				EntryMcap:  pos.entry.Mcap,
+				EntryKind:  pos.entry.Kind,
+				ExitMcap:   exitMcap,
+				ExitReason: "open",
+				ReturnPct:  ret,
+				HoldSec:    pos.lastTime.Sub(pos.entry.Time).Seconds(),
+				Open:       true,
+				Remaining:  pos.remaining,
+				Trades:     0,
+			}}
+			m[key] = a
+			order = append(order, key)
+			continue
+		}
+		a.stat.Open = true
+		a.stat.Remaining = pos.remaining
 	}
 	out := make([]CoinStat, 0, len(order))
 	for _, key := range order {

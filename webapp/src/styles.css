@@ -78,8 +78,16 @@ code {
   margin-bottom: 18px;
 }
 
+.bottom-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 16px;
+  margin-top: 18px;
+}
+
 @media (max-width: 900px) {
-  .top-grid {
+  .top-grid,
+  .bottom-grid {
     grid-template-columns: 1fr;
   }
 }
@@ -403,3 +411,27 @@ th {
   margin-top: 10px;
   color: var(--muted);
 }
+
+button.linkish {
+  border: 0;
+  background: transparent;
+  color: var(--accent);
+  cursor: pointer;
+  font: 600 0.85rem "IBM Plex Sans", sans-serif;
+  padding: 0;
+}
+
+button.linkish:hover {
+  text-decoration: underline;
+}
+
+.live-tag {
+  color: var(--accent);
+  font-weight: 600;
+}
+
+.pill-live {
+  border-color: var(--accent);
+  color: var(--accent);
+}
+

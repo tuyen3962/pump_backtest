@@ -10,7 +10,7 @@ services:
       - signal_data:/app/data
     environment:
       - TZ=${TZ:-Asia/Ho_Chi_Minh}
-    command: ["-addr", "0.0.0.0:8080", "-data", "/app/data/signals"]
+    command: ["-addr", "0.0.0.0:8080", "-data", "/app/data/signals", "-store", "/app/data"]
 
   signal-recorder:
     image: pump-backtest:latest

@@ -1,6 +1,9 @@
 # Recorded signal dumps (keep for local backtest)
 data/signals/*.ndjson
 data/signals/*.jsonl
+data/runs/
+data/history/
+data/watchlist.json
 
 # Go
 *.exe

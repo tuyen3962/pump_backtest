@@ -1,8 +1,10 @@
 import { useEffect, useMemo, useState } from "react";
 import {
+  fetchLastBacktest,
   fetchSources,
   runBacktest,
   type BacktestResponse,
+  type FollowRow,
   type Source,
 } from "../api";
 import { pnlClass } from "../format";
@@ -17,7 +19,12 @@ function sol(n: number | undefined | null, digits = 4): string {
   return `${sign}${Math.abs(v).toFixed(digits)} SOL`;
 }
 
-export function BacktestDesk() {
+type Props = {
+  onRunComplete?: () => void;
+  liveByMint?: Record<string, FollowRow>;
+};
+
+export function BacktestDesk({ onRunComplete, liveByMint }: Props) {
   const [sources, setSources] = useState<Source[]>([]);
   const [source, setSource] = useState("live");
   const [entryKinds, setEntryKinds] = useState<string[]>(["whale_armed"]);
@@ -34,6 +41,7 @@ export function BacktestDesk() {
   const [disableFilters, setDisableFilters] = useState(false);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState("");
+  const [savedAt, setSavedAt] = useState("");
   const [data, setData] = useState<BacktestResponse | null>(null);
 
   useEffect(() => {
@@ -44,13 +52,18 @@ export function BacktestDesk() {
         else if (list[0]) setSource(list[0].id);
       })
       .catch((err) => setError(String(err.message || err)));
-  }, []);
 
-  useEffect(() => {
-    if (!sources.length) return;
-    void run();
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [sources]);
+    fetchLastBacktest()
+      .then((last) => {
+        if (last.found && last.run) {
+          setData(last.run);
+          setSavedAt(last.savedAt || last.run.updated || "");
+        }
+      })
+      .catch(() => {
+        /* no prior run is fine */
+      });
+  }, []);
 
   const result = data?.result;
   const stats = useMemo(() => {
@@ -104,6 +117,8 @@ export function BacktestDesk() {
         exitWatchOut: false,
       });
       setData(res);
+      setSavedAt(res.updated || new Date().toISOString());
+      onRunComplete?.();
     } catch (err) {
       setError(String((err as Error).message || err));
     } finally {
@@ -268,8 +283,9 @@ export function BacktestDesk() {
               <strong>Balance (SOL)</strong>
               <span>
                 {data
-                  ? `${data.loaded} signals · ${result?.coins?.length || 0} coins · skip ${result?.skippedEntries ?? 0} · ${data.source}`
+                  ? `${data.loaded} signals · ${result?.coins?.length || 0} coins · skip ${result?.skippedEntries ?? 0}`
                   : "—"}
+                {savedAt ? ` · saved ${new Date(savedAt).toLocaleString()}` : ""}
               </span>
             </div>
             <EquityChart points={data?.equity || []} startCash={result?.config?.startCash} />
@@ -285,7 +301,7 @@ export function BacktestDesk() {
                 </span>
               ) : null}
             </div>
-            <CoinTable coins={result?.coins || []} unit="SOL" />
+            <CoinTable coins={result?.coins || []} unit="SOL" liveByMint={liveByMint} />
           </div>
         </div>
       </div>

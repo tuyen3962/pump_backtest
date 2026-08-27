@@ -100,14 +100,6 @@ export type TokenInfo = {
   rugScore?: number;
   rugLabel?: string;
   riskNotes?: string[];
-  liveSample?: {
-    windowSec: number;
-    trades: number;
-    buySol: number;
-    sellSol: number;
-    volumeSol: number;
-    sellRatio: number;
-  };
   sources?: string[];
   errors?: string[];
   fetchedAt?: string;
@@ -132,6 +124,41 @@ export type BacktestRequest = {
   stopLossPct?: number;
   scaleTriggerPct?: number;
   disableFilters?: boolean;
+};
+
+export type HistoryEntry = {
+  id: string;
+  mint: string;
+  symbol: string;
+  status: "closed" | "rugged" | "open_saved" | string;
+  exitReason: string;
+  entryKind: string;
+  entryMcap: number;
+  exitMcap: number;
+  returnPct: number;
+  pnlSol: number;
+  rugScore?: number;
+  rugLabel?: string;
+  holdSec: number;
+  closedAt: string;
+  runId?: string;
+};
+
+export type FollowRow = {
+  mint: string;
+  symbol: string;
+  entryMcap: number;
+  liveMcap: number;
+  returnPct: number;
+  volumeUsd1h: number;
+  volumeUsd24h: number;
+  liquidityUsd: number;
+  sellRatio1h: number;
+  rugScore: number;
+  rugLabel: string;
+  athDrawdownPct: number;
+  source: string;
+  error?: string;
 };
 
 async function readError(res: Response): Promise<string> {
@@ -159,6 +186,46 @@ export async function runBacktest(body: BacktestRequest): Promise<BacktestRespon
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(body),
   });
+  if (!res.ok) throw new Error(await readError(res));
+  return res.json();
+}
+
+export async function fetchLastBacktest(): Promise<{
+  found: boolean;
+  id?: string;
+  savedAt?: string;
+  run?: BacktestResponse;
+}> {
+  const res = await fetch("/api/backtest");
+  if (!res.ok) throw new Error(await readError(res));
+  return res.json();
+}
+
+export async function fetchHistory(status?: string): Promise<{ items: HistoryEntry[]; count: number }> {
+  const q = status ? `?status=${encodeURIComponent(status)}` : "";
+  const res = await fetch(`/api/history${q}`);
+  if (!res.ok) throw new Error(await readError(res));
+  return res.json();
+}
+
+export async function addWatch(mint: string, symbol?: string, entryMcap?: number) {
+  const res = await fetch("/api/watchlist", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ mint, symbol, entryMcap, source: "manual" }),
+  });
+  if (!res.ok) throw new Error(await readError(res));
+  return res.json();
+}
+
+export async function removeWatch(mint: string) {
+  const res = await fetch(`/api/watchlist?mint=${encodeURIComponent(mint)}`, { method: "DELETE" });
+  if (!res.ok) throw new Error(await readError(res));
+  return res.json();
+}
+
+export async function fetchFollow(): Promise<{ items: FollowRow[]; updatedAt: string }> {
+  const res = await fetch("/api/follow");
   if (!res.ok) throw new Error(await readError(res));
   return res.json();
 }

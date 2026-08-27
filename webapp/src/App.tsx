@@ -1,36 +1,49 @@
+import { useState } from "react";
 import { ContractCheck } from "./components/ContractCheck";
 import { BacktestDesk } from "./components/BacktestDesk";
+import { LiveFollow } from "./components/LiveFollow";
+import { HistoryPanel } from "./components/HistoryPanel";
+import { useFollowStream } from "./hooks/useFollowStream";
 
 export default function App() {
+  const [historyKey, setHistoryKey] = useState(0);
+  const [followKey, setFollowKey] = useState(0);
+  const follow = useFollowStream(followKey);
+
+  const bumpAll = () => {
+    setHistoryKey((k) => k + 1);
+    setFollowKey((k) => k + 1);
+  };
+
   return (
     <div className="wrap">
       <header className="hero">
         <p className="eyebrow">Pump Backtest Desk</p>
         <h1 className="brand">Theo dõi lối đánh memecoin</h1>
         <p className="lede">
-          Strategy v1: entry <code>whale_armed</code>, bankroll 1 SOL / 0.05 SOL mỗi lệnh — check
-          contract, theo dõi balance và tinh chỉnh filter trước khi paper realtime.
+          Chạy backtest → coin open được follow live (SSE 5s) ngay trên dashboard đang mở.
         </p>
       </header>
 
       <div className="top-grid">
-        <ContractCheck />
+        <ContractCheck onFollowed={() => setFollowKey((k) => k + 1)} />
         <section className="panel tip-panel">
           <h2>Workflow</h2>
           <ol className="steps">
-            <li>Paste mint → check volume & rug score</li>
-            <li>Chọn nguồn signal đã ghi / Demo</li>
-            <li>Chỉnh entry / fee / notional</li>
-            <li>Đọc balance + PnL + bảng coin để tinh chỉnh lối đánh</li>
+            <li>Chạy backtest → kết quả lưu + open vào Follow</li>
+            <li>Giữ dashboard mở → SSE push mcap mỗi 5s</li>
+            <li>Bảng Đồng coin hiện live return cho open</li>
+            <li>Coin đóng / rug vào Lịch sử</li>
           </ol>
-          <p className="panel-note">
-            Dev: <code>npm run dev</code> trong <code>webapp/</code> (proxy /api → :8080). Prod: build
-            embed vào Go dashboard.
-          </p>
         </section>
       </div>
 
-      <BacktestDesk />
+      <BacktestDesk onRunComplete={bumpAll} liveByMint={follow.byMint} />
+
+      <div className="bottom-grid">
+        <LiveFollow stream={follow} />
+        <HistoryPanel key={historyKey} />
+      </div>
     </div>
   );
 }

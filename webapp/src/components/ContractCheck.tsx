@@ -1,16 +1,19 @@
 import { useState } from "react";
-import { fetchToken, type TokenInfo } from "../api";
+import { addWatch, fetchToken, type TokenInfo } from "../api";
 import { money, moneyCompact, pct, shortMint } from "../format";
 
 type Props = {
   onChecked?: (info: TokenInfo) => void;
+  onFollowed?: () => void;
 };
 
-export function ContractCheck({ onChecked }: Props) {
+export function ContractCheck({ onChecked, onFollowed }: Props) {
   const [mint, setMint] = useState("");
   const [live, setLive] = useState(false);
   const [loading, setLoading] = useState(false);
+  const [followBusy, setFollowBusy] = useState(false);
   const [error, setError] = useState("");
+  const [note, setNote] = useState("");
   const [info, setInfo] = useState<TokenInfo | null>(null);
 
   async function onSubmit(e: React.FormEvent) {
@@ -31,6 +34,22 @@ export function ContractCheck({ onChecked }: Props) {
       setError(String((err as Error).message || err));
     } finally {
       setLoading(false);
+    }
+  }
+
+  async function onFollow() {
+    if (!info?.mint) return;
+    setFollowBusy(true);
+    setNote("");
+    setError("");
+    try {
+      await addWatch(info.mint, info.symbol, info.marketCapUsd);
+      setNote("Đã thêm vào Follow realtime");
+      onFollowed?.();
+    } catch (err) {
+      setError(String((err as Error).message || err));
+    } finally {
+      setFollowBusy(false);
     }
   }
 
@@ -114,6 +133,10 @@ export function ContractCheck({ onChecked }: Props) {
           <div className="token-price mono">
             price {money(info.priceUsd, 8)} · buys/sells 1h {info.buys1h ?? 0}/{info.sells1h ?? 0}
           </div>
+          <button type="button" className="run" style={{ marginTop: 10 }} onClick={() => void onFollow()} disabled={followBusy}>
+            {followBusy ? "Đang thêm…" : "Follow realtime"}
+          </button>
+          {note ? <div className="muted" style={{ marginTop: 8 }}>{note}</div> : null}
         </div>
       ) : null}
     </section>

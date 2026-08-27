@@ -4,6 +4,8 @@ import (
 	"context"
 	"encoding/json"
 	"flag"
+	"fmt"
+	"io"
 	"io/fs"
 	"log"
 	"net/http"
@@ -14,18 +16,29 @@ import (
 
 	"github.com/surt/pump_backtest/internal/backtest"
 	"github.com/surt/pump_backtest/internal/signal"
+	"github.com/surt/pump_backtest/internal/store"
 	"github.com/surt/pump_backtest/internal/tokeninfo"
 	"github.com/surt/pump_backtest/web"
 )
 
 func main() {
 	addr := flag.String("addr", "127.0.0.1:8080", "Listen address")
-	dataDir := flag.String("data", "data/signals", "Default recordings directory")
+	dataDir := flag.String("data", "data/signals", "Signal recordings directory")
+	storeRoot := flag.String("store", "", "Persistence root (default: parent of -data)")
 	flag.Parse()
 
 	if err := os.MkdirAll(*dataDir, 0o755); err != nil {
 		log.Fatalf("create data dir: %v", err)
 	}
+	root := *storeRoot
+	if root == "" {
+		root = filepath.Clean(filepath.Join(*dataDir, ".."))
+	}
+	st, err := store.New(root)
+	if err != nil {
+		log.Fatalf("store: %v", err)
+	}
+
 	static, err := fs.Sub(web.Dist, "dist")
 	if err != nil {
 		log.Fatal(err)
@@ -37,11 +50,30 @@ func main() {
 	})
 	mux.HandleFunc("/api/token", handleToken)
 	mux.HandleFunc("/api/backtest", func(w http.ResponseWriter, r *http.Request) {
-		handleBacktest(w, r, *dataDir)
+		switch r.Method {
+		case http.MethodPost:
+			handleBacktest(w, r, *dataDir, st)
+		case http.MethodGet:
+			handleLastBacktest(w, st)
+		default:
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		}
+	})
+	mux.HandleFunc("/api/history", func(w http.ResponseWriter, r *http.Request) {
+		handleHistory(w, r, st)
+	})
+	mux.HandleFunc("/api/watchlist", func(w http.ResponseWriter, r *http.Request) {
+		handleWatchlist(w, r, st)
+	})
+	mux.HandleFunc("/api/follow", func(w http.ResponseWriter, r *http.Request) {
+		handleFollow(w, r, st)
+	})
+	mux.HandleFunc("/api/follow/stream", func(w http.ResponseWriter, r *http.Request) {
+		handleFollowStream(w, r, st)
 	})
 	mux.Handle("/", spaHandler(static))
 
-	log.Printf("dashboard http://%s  data=%s", *addr, *dataDir)
+	log.Printf("dashboard http://%s  signals=%s  store=%s", *addr, *dataDir, root)
 	if err := http.ListenAndServe(*addr, mux); err != nil {
 		log.Fatal(err)
 	}
@@ -56,7 +88,6 @@ func spaHandler(static fs.FS) http.Handler {
 				fileServer.ServeHTTP(w, r)
 				return
 			}
-			// Missing asset (not SPA route) → 404
 			if strings.Contains(path, ".") {
 				http.NotFound(w, r)
 				return
@@ -113,11 +144,7 @@ func handleSources(w http.ResponseWriter, r *http.Request, dataDir string) {
 			name := e.Name()
 			if strings.HasSuffix(name, ".ndjson") || strings.HasSuffix(name, ".jsonl") {
 				p := filepath.Join(dataDir, name)
-				out = append(out, source{
-					ID:    "file:" + name,
-					Label: name,
-					Path:  p,
-				})
+				out = append(out, source{ID: "file:" + name, Label: name, Path: p})
 			}
 		}
 	}
@@ -148,13 +175,37 @@ func handleToken(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, info)
 }
 
-func handleBacktest(w http.ResponseWriter, r *http.Request, dataDir string) {
-	if r.Method != http.MethodPost {
-		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+func handleLastBacktest(w http.ResponseWriter, st *store.Store) {
+	run, err := st.LoadLastRun()
+	if err != nil {
+		if os.IsNotExist(err) {
+			writeJSON(w, map[string]any{"found": false})
+			return
+		}
+		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
+	var resp any
+	if err := json.Unmarshal(run.Response, &resp); err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	writeJSON(w, map[string]any{
+		"found":   true,
+		"id":      run.ID,
+		"savedAt": run.SavedAt.UTC().Format(time.RFC3339),
+		"run":     resp,
+	})
+}
+
+func handleBacktest(w http.ResponseWriter, r *http.Request, dataDir string, st *store.Store) {
 	var req backtestRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+	reqBytes, err := readBody(r)
+	if err != nil {
+		http.Error(w, "bad json: "+err.Error(), http.StatusBadRequest)
+		return
+	}
+	if err := json.Unmarshal(reqBytes, &req); err != nil {
 		http.Error(w, "bad json: "+err.Error(), http.StatusBadRequest)
 		return
 	}
@@ -178,6 +229,296 @@ func handleBacktest(w http.ResponseWriter, r *http.Request, dataDir string) {
 		return
 	}
 
+	cfg := buildConfig(req)
+	var market map[string]backtest.MarketSnapshot
+	if req.EnrichTokens {
+		ctx, cancel := context.WithTimeout(r.Context(), 60*time.Second)
+		market = backtest.MarketFromRecords(ctx, records, tokeninfo.Options{
+			SampleLive: req.SampleLive,
+			LiveWindow: 6 * time.Second,
+		})
+		cancel()
+	}
+
+	res, err := backtest.RunWithMarket(records, cfg, market)
+	if err != nil {
+		http.Error(w, "run: "+err.Error(), http.StatusBadRequest)
+		return
+	}
+	if req.EnrichTokens {
+		ctx, cancel := context.WithTimeout(r.Context(), 30*time.Second)
+		backtest.EnrichCoins(ctx, &res, tokeninfo.Options{})
+		cancel()
+	}
+
+	payload := map[string]any{
+		"source":  path,
+		"loaded":  len(records),
+		"result":  res,
+		"equity":  equityDTO(res),
+		"updated": time.Now().UTC().Format(time.RFC3339),
+	}
+	respBytes, _ := json.Marshal(payload)
+	runID := time.Now().UTC().Format("20060102_150405")
+	_ = st.SaveRun(store.SavedRun{
+		ID:        runID,
+		Request:   reqBytes,
+		Response:  respBytes,
+		Source:    path,
+		EndEquity: res.EndEquity,
+		TotalPnL:  res.TotalPnL,
+		CoinCount: len(res.Coins),
+	})
+
+	// Persist closed / rugged history + sync open coins into watchlist for live follow.
+	var hist []store.HistoryEntry
+	var openWatch []store.WatchItem
+	now := time.Now().UTC()
+	seenOpen := map[string]bool{}
+	for _, c := range res.Coins {
+		status := store.ClassifyStatus(c.ExitReason, c.RugScore, c.Open)
+		if c.Open {
+			if c.Mint != "" && !seenOpen[c.Mint] {
+				seenOpen[c.Mint] = true
+				openWatch = append(openWatch, store.WatchItem{
+					Mint:      c.Mint,
+					Symbol:    c.Symbol,
+					EntryMcap: c.EntryMcap,
+					AddedAt:   now,
+					Source:    "backtest_open",
+				})
+			}
+			continue
+		}
+		hist = append(hist, store.HistoryEntry{
+			Mint:       c.Mint,
+			Symbol:     c.Symbol,
+			Status:     status,
+			ExitReason: c.ExitReason,
+			EntryKind:  c.EntryKind,
+			EntryMcap:  c.EntryMcap,
+			ExitMcap:   c.ExitMcap,
+			ReturnPct:  c.ReturnPct,
+			PnLSOL:     c.PnLUSD,
+			RugScore:   c.RugScore,
+			RugLabel:   c.RugLabel,
+			HoldSec:    c.HoldSec,
+			ClosedAt:   now,
+			RunID:      runID,
+		})
+	}
+	_, _ = st.ReplaceSourceWatches("backtest_open", openWatch)
+	_ = st.AppendHistory(hist)
+
+	writeJSON(w, payload)
+}
+
+func handleHistory(w http.ResponseWriter, r *http.Request, st *store.Store) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	items, err := st.ListHistory(200)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	status := r.URL.Query().Get("status")
+	if status != "" {
+		filtered := items[:0]
+		for _, it := range items {
+			if it.Status == status {
+				filtered = append(filtered, it)
+			}
+		}
+		items = filtered
+	}
+	writeJSON(w, map[string]any{"items": items, "count": len(items)})
+}
+
+func handleWatchlist(w http.ResponseWriter, r *http.Request, st *store.Store) {
+	switch r.Method {
+	case http.MethodGet:
+		items, err := st.LoadWatchlist()
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		writeJSON(w, map[string]any{"items": items})
+	case http.MethodPost:
+		var body struct {
+			Mint      string  `json:"mint"`
+			Symbol    string  `json:"symbol"`
+			EntryMcap float64 `json:"entryMcap"`
+			Source    string  `json:"source"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		body.Mint = strings.TrimSpace(body.Mint)
+		if body.Mint == "" {
+			http.Error(w, "mint required", http.StatusBadRequest)
+			return
+		}
+		if body.Source == "" {
+			body.Source = "manual"
+		}
+		items, err := st.UpsertWatch(store.WatchItem{
+			Mint:      body.Mint,
+			Symbol:    body.Symbol,
+			EntryMcap: body.EntryMcap,
+			AddedAt:   time.Now().UTC(),
+			Source:    body.Source,
+		})
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		writeJSON(w, map[string]any{"items": items})
+	case http.MethodDelete:
+		mint := strings.TrimSpace(r.URL.Query().Get("mint"))
+		if mint == "" {
+			http.Error(w, "mint required", http.StatusBadRequest)
+			return
+		}
+		items, err := st.RemoveWatch(mint)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		writeJSON(w, map[string]any{"items": items})
+	default:
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+	}
+}
+
+func handleFollow(w http.ResponseWriter, r *http.Request, st *store.Store) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	ctx, cancel := context.WithTimeout(r.Context(), 45*time.Second)
+	defer cancel()
+	out, err := buildFollowRows(ctx, st)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	writeJSON(w, map[string]any{
+		"items":     out,
+		"updatedAt": time.Now().UTC().Format(time.RFC3339),
+	})
+}
+
+func handleFollowStream(w http.ResponseWriter, r *http.Request, st *store.Store) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	flusher, ok := w.(http.Flusher)
+	if !ok {
+		http.Error(w, "streaming unsupported", http.StatusInternalServerError)
+		return
+	}
+	w.Header().Set("Content-Type", "text/event-stream")
+	w.Header().Set("Cache-Control", "no-cache")
+	w.Header().Set("Connection", "keep-alive")
+	w.Header().Set("X-Accel-Buffering", "no")
+
+	send := func() bool {
+		ctx, cancel := context.WithTimeout(r.Context(), 40*time.Second)
+		rows, err := buildFollowRows(ctx, st)
+		cancel()
+		payload := map[string]any{
+			"items":     rows,
+			"updatedAt": time.Now().UTC().Format(time.RFC3339),
+		}
+		if err != nil {
+			payload["error"] = err.Error()
+			payload["items"] = []followRow{}
+		}
+		b, _ := json.Marshal(payload)
+		if _, err := fmt.Fprintf(w, "data: %s\n\n", b); err != nil {
+			return false
+		}
+		flusher.Flush()
+		return true
+	}
+
+	if !send() {
+		return
+	}
+	ticker := time.NewTicker(5 * time.Second)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-r.Context().Done():
+			return
+		case <-ticker.C:
+			if !send() {
+				return
+			}
+		}
+	}
+}
+
+type followRow struct {
+	Mint           string  `json:"mint"`
+	Symbol         string  `json:"symbol"`
+	EntryMcap      float64 `json:"entryMcap"`
+	LiveMcap       float64 `json:"liveMcap"`
+	ReturnPct      float64 `json:"returnPct"`
+	VolumeUSD1h    float64 `json:"volumeUsd1h"`
+	VolumeUSD24h   float64 `json:"volumeUsd24h"`
+	LiquidityUSD   float64 `json:"liquidityUsd"`
+	SellRatio1h    float64 `json:"sellRatio1h"`
+	RugScore       float64 `json:"rugScore"`
+	RugLabel       string  `json:"rugLabel"`
+	ATHDrawdownPct float64 `json:"athDrawdownPct"`
+	Source         string  `json:"source"`
+	Error          string  `json:"error,omitempty"`
+}
+
+func buildFollowRows(ctx context.Context, st *store.Store) ([]followRow, error) {
+	items, err := st.LoadWatchlist()
+	if err != nil {
+		return nil, err
+	}
+	out := make([]followRow, 0, len(items))
+	for _, it := range items {
+		row := followRow{
+			Mint:      it.Mint,
+			Symbol:    it.Symbol,
+			EntryMcap: it.EntryMcap,
+			Source:    it.Source,
+		}
+		info, err := tokeninfo.Fetch(ctx, it.Mint, tokeninfo.Options{})
+		if err != nil && len(info.Sources) == 0 {
+			row.Error = err.Error()
+			out = append(out, row)
+			continue
+		}
+		if info.Symbol != "" {
+			row.Symbol = info.Symbol
+		}
+		row.LiveMcap = info.MarketCapUSD
+		row.VolumeUSD1h = info.VolumeUSD1h
+		row.VolumeUSD24h = info.VolumeUSD24h
+		row.LiquidityUSD = info.LiquidityUSD
+		row.SellRatio1h = info.SellRatio1h
+		row.RugScore = info.RugScore
+		row.RugLabel = info.RugLabel
+		row.ATHDrawdownPct = info.ATHDrawdownPct
+		if it.EntryMcap > 0 && info.MarketCapUSD > 0 {
+			row.ReturnPct = (info.MarketCapUSD - it.EntryMcap) / it.EntryMcap * 100
+		}
+		out = append(out, row)
+	}
+	return out, nil
+}
+
+func buildConfig(req backtestRequest) backtest.Config {
 	cfg := backtest.DefaultConfig()
 	if len(req.EntryKinds) > 0 {
 		cfg.EntryKinds = req.EntryKinds
@@ -215,58 +556,28 @@ func handleBacktest(w http.ResponseWriter, r *http.Request, dataDir string) {
 		cfg.MinLiquidityUSD = 0
 		cfg.MinVolumeUSD1h = 0
 	}
+	return cfg
+}
 
-	var market map[string]backtest.MarketSnapshot
-	if req.EnrichTokens {
-		ctx, cancel := context.WithTimeout(r.Context(), 60*time.Second)
-		market = backtest.MarketFromRecords(ctx, records, tokeninfo.Options{
-			SampleLive: req.SampleLive,
-			LiveWindow: 6 * time.Second,
-		})
-		cancel()
-	}
-
-	res, err := backtest.RunWithMarket(records, cfg, market)
-	if err != nil {
-		http.Error(w, "run: "+err.Error(), http.StatusBadRequest)
-		return
-	}
-
-	if req.EnrichTokens {
-		ctx, cancel := context.WithTimeout(r.Context(), 30*time.Second)
-		backtest.EnrichCoins(ctx, &res, tokeninfo.Options{})
-		cancel()
-	}
-
-	type equityDTO struct {
-		Time          string  `json:"time"`
-		Equity        float64 `json:"equity"`
-		RealizedPnL   float64 `json:"realizedPnl"`
-		UnrealizedPnL float64 `json:"unrealizedPnl"`
-		OpenPositions int     `json:"openPositions"`
-		Event         string  `json:"event"`
-		Symbol        string  `json:"symbol,omitempty"`
-	}
-	eq := make([]equityDTO, 0, len(res.Equity))
+func equityDTO(res backtest.Result) []map[string]any {
+	eq := make([]map[string]any, 0, len(res.Equity))
 	for _, p := range res.Equity {
-		eq = append(eq, equityDTO{
-			Time:          p.Time.UTC().Format(time.RFC3339Nano),
-			Equity:        p.Equity,
-			RealizedPnL:   p.RealizedPnL,
-			UnrealizedPnL: p.UnrealizedPnL,
-			OpenPositions: p.OpenPositions,
-			Event:         p.Event,
-			Symbol:        p.Symbol,
+		eq = append(eq, map[string]any{
+			"time":          p.Time.UTC().Format(time.RFC3339Nano),
+			"equity":        p.Equity,
+			"realizedPnl":   p.RealizedPnL,
+			"unrealizedPnl": p.UnrealizedPnL,
+			"openPositions": p.OpenPositions,
+			"event":         p.Event,
+			"symbol":        p.Symbol,
 		})
 	}
+	return eq
+}
 
-	writeJSON(w, map[string]any{
-		"source":  path,
-		"loaded":  len(records),
-		"result":  res,
-		"equity":  eq,
-		"updated": time.Now().UTC().Format(time.RFC3339),
-	})
+func readBody(r *http.Request) ([]byte, error) {
+	defer r.Body.Close()
+	return io.ReadAll(r.Body)
 }
 
 func writeJSON(w http.ResponseWriter, v any) {

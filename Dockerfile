@@ -35,4 +35,4 @@ COPY testdata /app/testdata
 EXPOSE 8080
 VOLUME ["/app/data"]
 ENTRYPOINT ["/app/dashboard"]
-CMD ["-addr", "0.0.0.0:8080", "-data", "/app/data/signals"]
+CMD ["-addr", "0.0.0.0:8080", "-data", "/app/data/signals", "-store", "/app/data"]
