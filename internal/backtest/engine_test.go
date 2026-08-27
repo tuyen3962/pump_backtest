@@ -186,6 +186,43 @@ func TestEodMarkIsClosedTrade(t *testing.T) {
 	}
 }
 
+func TestTakeProfitUsesThresholdFill(t *testing.T) {
+	recs := []signal.Record{
+		rec("e1", signal.KindPump, "M9", "PPP", 1_000_000, 100_000),
+		rec("e2", signal.KindMilestone, "M9", "PPP", 1_010_000, 250_000), // 2.5x — should TP at 2.0x
+	}
+	cfg := backtest.DefaultConfig()
+	cfg.EntryKinds = []string{signal.KindPump}
+	cfg.FeeBps = 0
+	cfg.MinLiquidityUSD = 0
+	cfg.MinVolumeUSD1h = 0
+	cfg.LatencySec = 0
+	cfg.LatencySlipBps = 0
+	cfg.CloseOpenAtEnd = false
+	cfg.TakeProfit2x = 2.0
+	cfg.FirstTPFraction = 0.5
+	res, err := backtest.Run(recs, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var tp *backtest.Trade
+	for i := range res.Trades {
+		if res.Trades[i].ExitReason == "tp_2x_half" {
+			tp = &res.Trades[i]
+			break
+		}
+	}
+	if tp == nil {
+		t.Fatalf("expected tp_2x_half, trades=%+v", res.Trades)
+	}
+	if tp.Exit.Mcap < 199_000 || tp.Exit.Mcap > 201_000 {
+		t.Fatalf("TP fill should be ~2x entry (200k), got %f", tp.Exit.Mcap)
+	}
+	if res.OpenCount != 1 {
+		t.Fatalf("want 1 open remainder, got %d", res.OpenCount)
+	}
+}
+
 func rec(id, kind, mint, sym string, tsMs, mcap float64) signal.Record {
 	p := signal.Payload{Kind: kind, Symbol: sym, McapUsd: mcap}
 	raw, _ := json.Marshal(p)

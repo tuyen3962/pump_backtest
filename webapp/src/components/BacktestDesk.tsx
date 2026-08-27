@@ -146,12 +146,40 @@ export function BacktestDesk({ onRunComplete, onDraftChange, liveByMint, loadRun
   }, [loadRunId]);
 
   const result = data?.result;
+  const liveBook = useMemo(() => {
+    if (!result) return null;
+    const start = result.config?.startCash ?? 1;
+    const notional = result.config?.notionalUsd ?? 0.05;
+    const realized = result.totalPnl || 0;
+    let openUnreal = 0;
+    let liveMarks = 0;
+    for (const c of result.coins || []) {
+      if (!c.open) continue;
+      const rem = c.remaining && c.remaining > 0 ? c.remaining : 1;
+      const live = liveByMint?.[c.mint];
+      if (live?.liveMcap != null && c.entryMcap > 0) {
+        openUnreal += notional * rem * ((live.liveMcap - c.entryMcap) / c.entryMcap);
+        liveMarks++;
+      } else {
+        openUnreal += notional * rem * ((c.returnPct || 0) / 100);
+      }
+    }
+    const equity = start + realized + openUnreal;
+    return {
+      start,
+      realized,
+      openUnreal,
+      equity,
+      pnl: equity - start,
+      liveMarks,
+    };
+  }, [result, liveByMint]);
+
   const stats = useMemo(() => {
-    if (!result) return [];
-    const pnl = result.totalPnl || 0;
+    if (!result || !liveBook) return [];
     return [
-      { k: "Balance", v: sol(result.endEquity), cls: pnlClass(pnl) },
-      { k: "Lợi nhuận", v: sol(pnl), cls: pnlClass(pnl) },
+      { k: "Balance", v: sol(liveBook.equity), cls: pnlClass(liveBook.pnl) },
+      { k: "Lợi nhuận", v: sol(liveBook.pnl), cls: pnlClass(liveBook.pnl) },
       { k: "Win rate", v: `${(result.winRate || 0).toFixed(1)}%`, cls: "" },
       {
         k: "Max DD",
@@ -159,7 +187,7 @@ export function BacktestDesk({ onRunComplete, onDraftChange, liveByMint, loadRun
         cls: (result.maxDrawdownPct || 0) > 0 ? "down" : "",
       },
     ];
-  }, [result]);
+  }, [result, liveBook]);
 
   function toggleKind(kind: string) {
     setEntryKinds((prev) =>
@@ -370,6 +398,15 @@ export function BacktestDesk({ onRunComplete, onDraftChange, liveByMint, loadRun
                   </div>
                 ))}
           </div>
+          {liveBook && (result?.openCount || 0) > 0 ? (
+            <p className="panel-note" style={{ margin: "0 0 10px" }}>
+              Balance = bankroll + realized ({sol(liveBook.realized)}) + open unrealized (
+              {sol(liveBook.openUnreal)}
+              {liveBook.liveMarks ? ` · ${liveBook.liveMarks} live marks` : ""}). Chart bên dưới
+              là equity lúc hết replay — TP/SL chỉ chạy trên signal lịch sử, không tự cắt theo
+              giá live.
+            </p>
+          ) : null}
 
           <div className="chart-wrap">
             <div className="cap">

@@ -37,10 +37,14 @@ type Config struct {
 	// ScaleSellFraction: fraction of *remaining* size sold on each scale step.
 	ScaleSellFraction float64 `json:"scaleSellFraction"`
 
-	// LatencySec: assumed signal→fill delay for entry look-ahead fill.
+	// LatencySec: assumed signal→fill delay. When LatencyLookahead is true, fill
+	// uses the first post-delay mark; otherwise fill = signal×(1+LatencySlipBps).
 	LatencySec float64 `json:"latencySec"`
-	// LatencySlipBps: adverse entry slip if no post-latency mark exists.
+	// LatencySlipBps: adverse entry slip if no look-ahead mark (or Lookahead off).
 	LatencySlipBps float64 `json:"latencySlipBps"`
+	// LatencyLookahead: if true, resolve fill from a later mark after LatencySec.
+	// Default false — look-ahead often prices in the pump and makes 2x TP unreachable.
+	LatencyLookahead bool `json:"latencyLookahead"`
 
 	// MinLiquidityUSD / MinVolumeUSD1h: skip entry when market snapshot fails gate.
 	MinLiquidityUSD float64 `json:"minLiquidityUsd"`
@@ -70,8 +74,9 @@ func DefaultConfig() Config {
 		FirstTPFraction:   0.5,
 		ScaleTriggerPct:   15,  // mid of 10–20%
 		ScaleSellFraction: 0.15,
-		LatencySec:        5, // suggested default — see docs in CLI/UI
+		LatencySec:        5,
 		LatencySlipBps:    50,
+		LatencyLookahead:  false,
 		MinLiquidityUSD:   5000,
 		MinVolumeUSD1h:    2000,
 	}
@@ -170,6 +175,7 @@ type position struct {
 	sizeSOL    float64
 	remaining  float64 // 0..1 of original
 	lastMcap   float64
+	peakMcap   float64 // high-water since entry (for TP cross detection)
 	lastTime   time.Time
 	lastKind   string
 	lastSigID  string
@@ -311,23 +317,53 @@ func RunWithMarket(records []signal.Record, cfg Config, market map[string]Market
 				pos.lastTime = ts
 				pos.lastKind = kind
 				pos.lastSigID = rec.Raw.ID
+				if mcap > pos.peakMcap {
+					pos.peakMcap = mcap
+				}
+				// Out/payload may carry a session peak higher than this tick.
+				if rec.Payload.PeakMcap > pos.peakMcap {
+					pos.peakMcap = rec.Payload.PeakMcap
+				}
 				snapshot(ts, "mark:"+kind, sym)
 
 				mult := mcap / pos.entry.Mcap
-				// Hard stop -60%
+				peakMult := 0.0
+				if pos.entry.Mcap > 0 {
+					peakMult = pos.peakMcap / pos.entry.Mcap
+				}
+				// Hard stop -60% (on current mark)
 				if cfg.StopLossPct > 0 && mult <= (1-cfg.StopLossPct/100) {
 					closeAll(mint, sellFill(ts, mint, sym, kind, mcap, rec.Raw.ID), "stop_loss", false)
 					continue
 				}
-				// First TP at 2x → sell half
-				if !pos.halfTaken && cfg.TakeProfit2x > 0 && mult >= cfg.TakeProfit2x {
-					sellFrac(mint, cfg.FirstTPFraction, sellFill(ts, mint, sym, kind, mcap, rec.Raw.ID), "tp_2x_half", false)
-					if p2 := positions[mint]; p2 != nil {
-						p2.halfTaken = true
-						p2.lastTPMcap = mcap
+				// First TP at 2x → sell half. If peak crossed TP but this tick is
+				// still ≥ TP, fill at threshold; if tick already below TP after a
+				// gap, we missed the print (no synthetic fill above last mark).
+				if !pos.halfTaken && cfg.TakeProfit2x > 0 && peakMult >= cfg.TakeProfit2x {
+					exitMcap := mcap
+					target := pos.entry.Mcap * cfg.TakeProfit2x
+					if mcap >= target {
+						exitMcap = target // crossed this tick — fill at TP
+					} else if peakMult >= cfg.TakeProfit2x && mult >= cfg.TakeProfit2x {
+						exitMcap = mcap
+					} else {
+						// Peak was ≥ TP earlier but we never observed a mark ≥ TP
+						// (shouldn't happen if peak comes from marks). If peak only
+						// from PeakMcap field, sell at target capped by peak.
+						if rec.Payload.PeakMcap >= target {
+							exitMcap = target
+						} else {
+							exitMcap = 0 // skip — cannot honestly fill
+						}
+					}
+					if exitMcap > 0 {
+						sellFrac(mint, cfg.FirstTPFraction, sellFill(ts, mint, sym, kind, exitMcap, rec.Raw.ID), "tp_2x_half", false)
+						if p2 := positions[mint]; p2 != nil {
+							p2.halfTaken = true
+							p2.lastTPMcap = exitMcap
+						}
 					}
 				} else if pos.halfTaken && cfg.ScaleTriggerPct > 0 && pos.lastTPMcap > 0 && mcap >= pos.lastTPMcap*(1+cfg.ScaleTriggerPct/100) {
-					// Scale-out: sell fraction of remaining
 					fracOrig := pos.remaining * cfg.ScaleSellFraction
 					sellFrac(mint, fracOrig, sellFill(ts, mint, sym, kind, mcap, rec.Raw.ID), "scale_tp", false)
 					if p2 := positions[mint]; p2 != nil {
@@ -401,6 +437,7 @@ func RunWithMarket(records []signal.Record, cfg Config, market map[string]Market
 			sizeSOL:   cfg.NotionalUSD,
 			remaining: 1,
 			lastMcap:  fillMcap,
+			peakMcap:  fillMcap,
 			lastTime:  ts,
 			lastKind:  kind,
 			lastSigID: rec.Raw.ID,
@@ -533,24 +570,33 @@ func sellFill(ts time.Time, mint, sym, kind string, mcap float64, id string) Fil
 }
 
 func resolveEntryMcap(records []signal.Record, idx int, mint string, signalMcap float64, ts time.Time, cfg Config) float64 {
-	if cfg.LatencySec > 0 {
-		deadline := ts.Add(time.Duration(cfg.LatencySec * float64(time.Second)))
-		for j := idx + 1; j < len(records); j++ {
-			r := records[j]
-			if r.Raw.Mint != mint {
-				continue
+	slip := cfg.LatencySlipBps / 10_000
+	adverse := signalMcap * (1 + slip)
+	if !cfg.LatencyLookahead || cfg.LatencySec <= 0 {
+		return adverse
+	}
+	deadline := ts.Add(time.Duration(cfg.LatencySec * float64(time.Second)))
+	for j := idx + 1; j < len(records); j++ {
+		r := records[j]
+		if r.Raw.Mint != mint {
+			continue
+		}
+		if r.EventTime().Before(deadline) {
+			continue
+		}
+		if m := r.Mcap(); m > 0 {
+			// Cap look-ahead chase so a 5s pump doesn't become the entry basis for 2x TP.
+			cap := signalMcap * 1.25
+			if m > cap {
+				return cap
 			}
-			if r.EventTime().Before(deadline) {
-				continue
+			if m < signalMcap {
+				return adverse // worse than signal — keep adverse slip
 			}
-			if m := r.Mcap(); m > 0 {
-				return m
-			}
+			return m
 		}
 	}
-	// No post-latency mark → adverse slip on entry.
-	slip := cfg.LatencySlipBps / 10_000
-	return signalMcap * (1 + slip)
+	return adverse
 }
 
 func passMarketGate(mint string, market map[string]MarketSnapshot, cfg Config) bool {
