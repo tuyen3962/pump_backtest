@@ -5,13 +5,16 @@ type Props = {
   coins: CoinStat[];
   unit?: "USD" | "SOL";
   liveByMint?: Record<string, FollowRow>;
+  /** Size per entry in SOL — used for live unrealized PnL. */
+  notionalSol?: number;
 };
 
-export function CoinTable({ coins, unit = "SOL", liveByMint }: Props) {
+export function CoinTable({ coins, unit = "SOL", liveByMint, notionalSol = 0.05 }: Props) {
   if (!coins.length) {
     return (
       <div className="empty">
-        Chưa có trade — cần `whale_armed` (và pass filter liq/vol nếu đang bật).
+        Chưa có trade — cần signal <code>pump</code> (hoặc kind đã chọn) và đủ free
+        bankroll; nếu bật enrich thì phải pass filter liq/vol.
       </div>
     );
   }
@@ -36,7 +39,15 @@ export function CoinTable({ coins, unit = "SOL", liveByMint }: Props) {
           {coins.map((c) => {
             const live = c.open && liveByMint ? liveByMint[c.mint] : undefined;
             const ret = live?.liveMcap ? live.returnPct : c.returnPct;
-            const cls = pnlClass(live?.liveMcap ? ret : c.pnlUsd);
+            // Open + live: unrealized = size × remaining × live return.
+            // Closed: realized pnl from backtest legs.
+            const rem = c.remaining && c.remaining > 0 ? c.remaining : 1;
+            const livePnl =
+              live?.liveMcap != null && Number.isFinite(ret)
+                ? notionalSol * rem * (ret / 100)
+                : null;
+            const pnl = livePnl != null ? livePnl : c.pnlUsd;
+            const cls = pnlClass(pnl);
             const rugScore = live?.rugScore ?? c.rugScore ?? 0;
             const rugCls = rugScore >= 45 ? "down" : rugScore >= 25 ? "" : "up";
             const vol = live?.volumeUsd24h || c.volumeUsd24h;
@@ -75,7 +86,10 @@ export function CoinTable({ coins, unit = "SOL", liveByMint }: Props) {
                   </div>
                 </td>
                 <td className={`mono ${cls}`}>{pct(ret)}</td>
-                <td className={`mono ${pnlClass(c.pnlUsd)}`}>{pnlFmt(c.pnlUsd)}</td>
+                <td className={`mono ${cls}`}>
+                  {pnlFmt(pnl)}
+                  {livePnl != null ? <div className="mint live-tag">unrealized</div> : null}
+                </td>
                 <td>
                   <span className={`pill ${c.open ? "pill-live" : ""}`}>
                     {c.open ? (live?.liveMcap ? "open/live" : "open/mtm") : "closed"}

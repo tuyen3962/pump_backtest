@@ -26,6 +26,7 @@ export type CoinStat = {
   entryKind: string;
   exitReason: string;
   holdSec: number;
+  remaining?: number;
   volumeUsd24h?: number;
   volumeUsd1h?: number;
   liquidityUsd?: number;
@@ -67,6 +68,8 @@ export type BacktestResult = {
 };
 
 export type BacktestResponse = {
+  id?: string;
+  label?: string;
   source: string;
   loaded: number;
   result: BacktestResult;
@@ -107,6 +110,7 @@ export type TokenInfo = {
 
 export type BacktestRequest = {
   source: string;
+  label?: string;
   entryKinds: string[];
   startCash: number;
   notionalUsd: number;
@@ -123,7 +127,62 @@ export type BacktestRequest = {
   latencySec?: number;
   stopLossPct?: number;
   scaleTriggerPct?: number;
+  takeProfit2x?: number;
   disableFilters?: boolean;
+  async?: boolean;
+  updateWatchlist?: boolean;
+};
+
+export type RunSummary = {
+  id: string;
+  label?: string;
+  savedAt: string;
+  source?: string;
+  endEquity: number;
+  totalPnl: number;
+  coinCount: number;
+  winRate: number;
+  maxDrawdownPct: number;
+  openCount: number;
+  closedCount: number;
+  signals: number;
+  entryKinds?: string[];
+};
+
+export type CompareRow = {
+  id: string;
+  label: string;
+  savedAt: string;
+  source: string;
+  entryKinds: string[];
+  signals: number;
+  coins: number;
+  closedCount: number;
+  openCount: number;
+  winRate: number;
+  avgReturn: number;
+  totalPnl: number;
+  endEquity: number;
+  maxDrawdownPct: number;
+  skippedEntries: number;
+  stopLossPct: number;
+  takeProfit2x: number;
+  feeBps: number;
+  latencySec: number;
+  notionalUsd: number;
+  startCash: number;
+};
+
+export type JobStatus = {
+  id: string;
+  label?: string;
+  status: "queued" | "running" | "done" | "failed" | "cancelled" | string;
+  createdAt: string;
+  startedAt?: string;
+  finishedAt?: string;
+  error?: string;
+  runId?: string;
+  progress?: string;
 };
 
 export type HistoryEntry = {
@@ -184,10 +243,54 @@ export async function runBacktest(body: BacktestRequest): Promise<BacktestRespon
   const res = await fetch("/api/backtest", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(body),
+    body: JSON.stringify({ ...body, async: false }),
   });
   if (!res.ok) throw new Error(await readError(res));
   return res.json();
+}
+
+export async function enqueueBacktest(body: BacktestRequest): Promise<{ job: JobStatus }> {
+  const res = await fetch("/api/backtest", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ ...body, async: true, updateWatchlist: false }),
+  });
+  if (!res.ok) throw new Error(await readError(res));
+  return res.json();
+}
+
+export async function fetchJobs(): Promise<{ items: JobStatus[] }> {
+  const res = await fetch("/api/jobs");
+  if (!res.ok) throw new Error(await readError(res));
+  return res.json();
+}
+
+export async function fetchJob(id: string): Promise<JobStatus> {
+  const res = await fetch(`/api/jobs/${encodeURIComponent(id)}`);
+  if (!res.ok) throw new Error(await readError(res));
+  return res.json();
+}
+
+export async function fetchRuns(): Promise<{ items: RunSummary[]; count: number }> {
+  const res = await fetch("/api/runs");
+  if (!res.ok) throw new Error(await readError(res));
+  return res.json();
+}
+
+export async function fetchRun(id: string): Promise<{ id: string; label?: string; savedAt: string; run: BacktestResponse }> {
+  const res = await fetch(`/api/runs/${encodeURIComponent(id)}`);
+  if (!res.ok) throw new Error(await readError(res));
+  return res.json();
+}
+
+export async function compareRuns(ids: string[]): Promise<{ items: CompareRow[]; count: number }> {
+  const res = await fetch(`/api/runs?compare=${ids.map(encodeURIComponent).join(",")}`);
+  if (!res.ok) throw new Error(await readError(res));
+  return res.json();
+}
+
+export function exportRunCsvUrl(id: string, part: "trades" | "coins" | "equity" | "summary" = "trades"): string {
+  return `/api/runs/${encodeURIComponent(id)}/export.csv?part=${part}`;
 }
 
 export async function fetchLastBacktest(): Promise<{

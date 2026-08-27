@@ -17,7 +17,7 @@ import (
 
 func main() {
 	in := flag.String("in", "data/signals", "NDJSON file or directory from signal-recorder")
-	entry := flag.String("entry", "whale_armed", "Comma-separated entry signal kinds")
+	entry := flag.String("entry", "pump", "Comma-separated entry signal kinds")
 	bankroll := flag.Float64("bankroll", 1, "Start bankroll in SOL")
 	size := flag.Float64("size", 0.05, "SOL size per entry")
 	feeBps := flag.Float64("fee-bps", 100, "Round-trip fee/slippage proxy in basis points")
@@ -27,7 +27,7 @@ func main() {
 	noFilter := flag.Bool("no-filter", false, "Disable liquidity/volume gates")
 	enrich := flag.Bool("enrich", true, "Fetch live volume/rug + apply entry filters")
 	live := flag.Bool("live-sample", false, "Also sample PumpDev WS while enriching")
-	noEOD := flag.Bool("no-eod", false, "Do not mark-to-market open positions at end")
+	closeEOD := flag.Bool("eod", false, "Mark-to-market (close) open positions at end of replay")
 	flag.Parse()
 
 	records, err := signal.LoadNDJSON(*in)
@@ -41,7 +41,7 @@ func main() {
 	cfg.NotionalUSD = *size
 	cfg.FeeBps = *feeBps
 	cfg.LatencySec = *latency
-	cfg.CloseOpenAtEnd = !*noEOD
+	cfg.CloseOpenAtEnd = *closeEOD
 	if *noFilter {
 		cfg.MinLiquidityUSD = 0
 		cfg.MinVolumeUSD1h = 0

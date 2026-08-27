@@ -15,7 +15,6 @@ import (
 	"time"
 
 	"github.com/surt/pump_backtest/internal/backtest"
-	"github.com/surt/pump_backtest/internal/signal"
 	"github.com/surt/pump_backtest/internal/store"
 	"github.com/surt/pump_backtest/internal/tokeninfo"
 	"github.com/surt/pump_backtest/web"
@@ -38,6 +37,7 @@ func main() {
 	if err != nil {
 		log.Fatalf("store: %v", err)
 	}
+	hub := newBacktestHub(*dataDir, st)
 
 	static, err := fs.Sub(web.Dist, "dist")
 	if err != nil {
@@ -52,12 +52,24 @@ func main() {
 	mux.HandleFunc("/api/backtest", func(w http.ResponseWriter, r *http.Request) {
 		switch r.Method {
 		case http.MethodPost:
-			handleBacktest(w, r, *dataDir, st)
+			handleBacktest(w, r, hub)
 		case http.MethodGet:
 			handleLastBacktest(w, st)
 		default:
 			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		}
+	})
+	mux.HandleFunc("/api/jobs", func(w http.ResponseWriter, r *http.Request) {
+		handleJobs(w, r, hub)
+	})
+	mux.HandleFunc("/api/jobs/", func(w http.ResponseWriter, r *http.Request) {
+		handleJobByID(w, r, hub)
+	})
+	mux.HandleFunc("/api/runs", func(w http.ResponseWriter, r *http.Request) {
+		handleRuns(w, r, st)
+	})
+	mux.HandleFunc("/api/runs/", func(w http.ResponseWriter, r *http.Request) {
+		handleRunByID(w, r, st)
 	})
 	mux.HandleFunc("/api/history", func(w http.ResponseWriter, r *http.Request) {
 		handleHistory(w, r, st)
@@ -101,25 +113,6 @@ func spaHandler(static fs.FS) http.Handler {
 		w.Header().Set("Content-Type", "text/html; charset=utf-8")
 		_, _ = w.Write(data)
 	})
-}
-
-type backtestRequest struct {
-	Source            string   `json:"source"`
-	EntryKinds        []string `json:"entryKinds"`
-	StartCash         float64  `json:"startCash"`
-	NotionalUSD       float64  `json:"notionalUsd"`
-	FeeBps            float64  `json:"feeBps"`
-	MaxPositions      int      `json:"maxPositions"`
-	CloseOpenAtEnd    bool     `json:"closeOpenAtEnd"`
-	EnrichTokens      bool     `json:"enrichTokens"`
-	SampleLive        bool     `json:"sampleLive"`
-	AlsoExitMustOut   *bool    `json:"alsoExitMustOut"`
-	MinLiquidityUSD   *float64 `json:"minLiquidityUsd"`
-	MinVolumeUSD1h    *float64 `json:"minVolumeUsd1h"`
-	LatencySec        *float64 `json:"latencySec"`
-	StopLossPct       *float64 `json:"stopLossPct"`
-	ScaleTriggerPct   *float64 `json:"scaleTriggerPct"`
-	DisableFilters    bool     `json:"disableFilters"`
 }
 
 func handleSources(w http.ResponseWriter, r *http.Request, dataDir string) {
@@ -198,7 +191,7 @@ func handleLastBacktest(w http.ResponseWriter, st *store.Store) {
 	})
 }
 
-func handleBacktest(w http.ResponseWriter, r *http.Request, dataDir string, st *store.Store) {
+func handleBacktest(w http.ResponseWriter, r *http.Request, hub *backtestHub) {
 	var req backtestRequest
 	reqBytes, err := readBody(r)
 	if err != nil {
@@ -209,108 +202,208 @@ func handleBacktest(w http.ResponseWriter, r *http.Request, dataDir string, st *
 		http.Error(w, "bad json: "+err.Error(), http.StatusBadRequest)
 		return
 	}
-
-	path := dataDir
-	switch {
-	case req.Source == "" || req.Source == "live":
-		path = dataDir
-	case req.Source == "demo":
-		path = "testdata/signals/demo.ndjson"
-	case strings.HasPrefix(req.Source, "file:"):
-		name := filepath.Base(strings.TrimPrefix(req.Source, "file:"))
-		path = filepath.Join(dataDir, name)
-	default:
-		path = req.Source
-	}
-
-	records, err := signal.LoadNDJSON(path)
-	if err != nil {
-		http.Error(w, "load: "+err.Error(), http.StatusBadRequest)
+	async := req.Async || r.URL.Query().Get("async") == "1"
+	if async {
+		// Compare/lab runs should not clobber the live follow watchlist.
+		if req.UpdateWatchlist == nil {
+			f := false
+			req.UpdateWatchlist = &f
+		}
+		job, err := hub.enqueue(req, reqBytes)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusTooManyRequests)
+			return
+		}
+		writeJSON(w, map[string]any{"job": job})
 		return
 	}
 
-	cfg := buildConfig(req)
-	var market map[string]backtest.MarketSnapshot
-	if req.EnrichTokens {
-		ctx, cancel := context.WithTimeout(r.Context(), 60*time.Second)
-		market = backtest.MarketFromRecords(ctx, records, tokeninfo.Options{
-			SampleLive: req.SampleLive,
-			LiveWindow: 6 * time.Second,
-		})
-		cancel()
+	updateWatch := true
+	if req.UpdateWatchlist != nil {
+		updateWatch = *req.UpdateWatchlist
 	}
-
-	res, err := backtest.RunWithMarket(records, cfg, market)
+	out, err := hub.execute(r.Context(), req, reqBytes, "", updateWatch)
 	if err != nil {
-		http.Error(w, "run: "+err.Error(), http.StatusBadRequest)
+		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
-	if req.EnrichTokens {
-		ctx, cancel := context.WithTimeout(r.Context(), 30*time.Second)
-		backtest.EnrichCoins(ctx, &res, tokeninfo.Options{})
-		cancel()
-	}
+	writeJSON(w, out.Payload)
+}
 
-	payload := map[string]any{
-		"source":  path,
-		"loaded":  len(records),
-		"result":  res,
-		"equity":  equityDTO(res),
-		"updated": time.Now().UTC().Format(time.RFC3339),
+func handleJobs(w http.ResponseWriter, r *http.Request, hub *backtestHub) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
 	}
-	respBytes, _ := json.Marshal(payload)
-	runID := time.Now().UTC().Format("20060102_150405")
-	_ = st.SaveRun(store.SavedRun{
-		ID:        runID,
-		Request:   reqBytes,
-		Response:  respBytes,
-		Source:    path,
-		EndEquity: res.EndEquity,
-		TotalPnL:  res.TotalPnL,
-		CoinCount: len(res.Coins),
-	})
+	writeJSON(w, map[string]any{"items": hub.runner.List(50)})
+}
 
-	// Persist closed / rugged history + sync open coins into watchlist for live follow.
-	var hist []store.HistoryEntry
-	var openWatch []store.WatchItem
-	now := time.Now().UTC()
-	seenOpen := map[string]bool{}
-	for _, c := range res.Coins {
-		status := store.ClassifyStatus(c.ExitReason, c.RugScore, c.Open)
-		if c.Open {
-			if c.Mint != "" && !seenOpen[c.Mint] {
-				seenOpen[c.Mint] = true
-				openWatch = append(openWatch, store.WatchItem{
-					Mint:      c.Mint,
-					Symbol:    c.Symbol,
-					EntryMcap: c.EntryMcap,
-					AddedAt:   now,
-					Source:    "backtest_open",
-				})
-			}
+func handleJobByID(w http.ResponseWriter, r *http.Request, hub *backtestHub) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	id := strings.TrimPrefix(r.URL.Path, "/api/jobs/")
+	id = filepath.Base(id)
+	job, ok := hub.runner.Get(id)
+	if !ok {
+		http.Error(w, "job not found", http.StatusNotFound)
+		return
+	}
+	writeJSON(w, job)
+}
+
+func handleRuns(w http.ResponseWriter, r *http.Request, st *store.Store) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	if r.URL.Query().Get("compare") != "" {
+		handleCompareRuns(w, r, st)
+		return
+	}
+	items, err := st.ListRuns(100)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	writeJSON(w, map[string]any{"items": items, "count": len(items)})
+}
+
+func handleCompareRuns(w http.ResponseWriter, r *http.Request, st *store.Store) {
+	raw := r.URL.Query().Get("compare")
+	ids := strings.Split(raw, ",")
+	type row struct {
+		ID          string   `json:"id"`
+		Label       string   `json:"label"`
+		SavedAt     string   `json:"savedAt"`
+		Source      string   `json:"source"`
+		EntryKinds  []string `json:"entryKinds"`
+		Signals     int      `json:"signals"`
+		Coins       int      `json:"coins"`
+		Closed      int      `json:"closedCount"`
+		Open        int      `json:"openCount"`
+		WinRate     float64  `json:"winRate"`
+		AvgReturn   float64  `json:"avgReturn"`
+		TotalPnL    float64  `json:"totalPnl"`
+		EndEquity   float64  `json:"endEquity"`
+		MaxDDPct    float64  `json:"maxDrawdownPct"`
+		Skipped     int      `json:"skippedEntries"`
+		StopLossPct float64  `json:"stopLossPct"`
+		TP2x        float64  `json:"takeProfit2x"`
+		FeeBps      float64  `json:"feeBps"`
+		LatencySec  float64  `json:"latencySec"`
+		Notional    float64  `json:"notionalUsd"`
+		StartCash   float64  `json:"startCash"`
+	}
+	var rows []row
+	for _, id := range ids {
+		id = strings.TrimSpace(id)
+		if id == "" {
 			continue
 		}
-		hist = append(hist, store.HistoryEntry{
-			Mint:       c.Mint,
-			Symbol:     c.Symbol,
-			Status:     status,
-			ExitReason: c.ExitReason,
-			EntryKind:  c.EntryKind,
-			EntryMcap:  c.EntryMcap,
-			ExitMcap:   c.ExitMcap,
-			ReturnPct:  c.ReturnPct,
-			PnLSOL:     c.PnLUSD,
-			RugScore:   c.RugScore,
-			RugLabel:   c.RugLabel,
-			HoldSec:    c.HoldSec,
-			ClosedAt:   now,
-			RunID:      runID,
+		run, err := st.LoadRun(id)
+		if err != nil {
+			continue
+		}
+		res, _, err := resultFromSaved(run)
+		if err != nil {
+			rows = append(rows, row{
+				ID: run.ID, Label: run.Label, Source: run.Source,
+				TotalPnL: run.TotalPnL, EndEquity: run.EndEquity, WinRate: run.WinRate,
+				MaxDDPct: run.MaxDDPct, Coins: run.CoinCount, EntryKinds: run.EntryKinds,
+				SavedAt: run.SavedAt.UTC().Format(time.RFC3339),
+			})
+			continue
+		}
+		cfg := res.Config
+		rows = append(rows, row{
+			ID:          run.ID,
+			Label:       run.Label,
+			SavedAt:     run.SavedAt.UTC().Format(time.RFC3339),
+			Source:      run.Source,
+			EntryKinds:  cfg.EntryKinds,
+			Signals:     res.Signals,
+			Coins:       len(res.Coins),
+			Closed:      res.ClosedCount,
+			Open:        res.OpenCount,
+			WinRate:     res.WinRate,
+			AvgReturn:   res.AvgReturn,
+			TotalPnL:    res.TotalPnL,
+			EndEquity:   res.EndEquity,
+			MaxDDPct:    res.MaxDrawdown,
+			Skipped:     res.Skipped,
+			StopLossPct: cfg.StopLossPct,
+			TP2x:        cfg.TakeProfit2x,
+			FeeBps:      cfg.FeeBps,
+			LatencySec:  cfg.LatencySec,
+			Notional:    cfg.NotionalUSD,
+			StartCash:   cfg.StartCash,
 		})
 	}
-	_, _ = st.ReplaceSourceWatches("backtest_open", openWatch)
-	_ = st.AppendHistory(hist)
+	writeJSON(w, map[string]any{"items": rows, "count": len(rows)})
+}
 
-	writeJSON(w, payload)
+func handleRunByID(w http.ResponseWriter, r *http.Request, st *store.Store) {
+	path := strings.TrimPrefix(r.URL.Path, "/api/runs/")
+	parts := strings.Split(strings.Trim(path, "/"), "/")
+	if len(parts) == 0 || parts[0] == "" {
+		http.Error(w, "run id required", http.StatusBadRequest)
+		return
+	}
+	id := filepath.Base(parts[0])
+	run, err := st.LoadRun(id)
+	if err != nil {
+		http.Error(w, "run not found", http.StatusNotFound)
+		return
+	}
+
+	if len(parts) >= 2 && parts[1] == "export.csv" {
+		if r.Method != http.MethodGet {
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		res, _, err := resultFromSaved(run)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		part := r.URL.Query().Get("part")
+		if part == "" {
+			part = "trades"
+		}
+		filename := fmt.Sprintf("%s_%s.csv", id, part)
+		writeCSVDownload(w, filename, func(w http.ResponseWriter) error {
+			switch part {
+			case "coins":
+				return backtest.WriteCoinsCSV(w, res)
+			case "equity":
+				return backtest.WriteEquityCSV(w, res)
+			case "summary":
+				return backtest.WriteSummaryCSV(w, res, run.ID, run.Label, run.Source)
+			default:
+				return backtest.WriteTradesCSV(w, res)
+			}
+		})
+		return
+	}
+
+	if r.Method != http.MethodGet {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	var resp any
+	if err := json.Unmarshal(run.Response, &resp); err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	writeJSON(w, map[string]any{
+		"id":      run.ID,
+		"label":   run.Label,
+		"savedAt": run.SavedAt.UTC().Format(time.RFC3339),
+		"source":  run.Source,
+		"run":     resp,
+	})
 }
 
 func handleHistory(w http.ResponseWriter, r *http.Request, st *store.Store) {
@@ -551,6 +644,9 @@ func buildConfig(req backtestRequest) backtest.Config {
 	}
 	if req.ScaleTriggerPct != nil {
 		cfg.ScaleTriggerPct = *req.ScaleTriggerPct
+	}
+	if req.TakeProfit2x != nil && *req.TakeProfit2x > 0 {
+		cfg.TakeProfit2x = *req.TakeProfit2x
 	}
 	if req.DisableFilters {
 		cfg.MinLiquidityUSD = 0

@@ -38,6 +38,7 @@ func TestStopLossAndWhaleEntry(t *testing.T) {
 		rec("a2", signal.KindWhaleArmed, "M1", "AAA", 1_100_000, 35_000), // -65%
 	}
 	cfg := backtest.DefaultConfig()
+	cfg.EntryKinds = []string{signal.KindWhaleArmed}
 	cfg.FeeBps = 0
 	cfg.MinLiquidityUSD = 0
 	cfg.MinVolumeUSD1h = 0
@@ -65,6 +66,7 @@ func TestTakeProfitHalf(t *testing.T) {
 		rec("b2", signal.KindMilestone, "M2", "BBB", 1_200_000, 120_000), // 2.4x
 	}
 	cfg := backtest.DefaultConfig()
+	cfg.EntryKinds = []string{signal.KindWhaleArmed}
 	cfg.FeeBps = 0
 	cfg.MinLiquidityUSD = 0
 	cfg.MinVolumeUSD1h = 0
@@ -86,6 +88,101 @@ func TestTakeProfitHalf(t *testing.T) {
 	}
 	if !foundHalf {
 		t.Fatalf("missing tp_2x_half in %+v", res.Trades)
+	}
+}
+
+func TestMultiPositionPumpHold(t *testing.T) {
+	recs := []signal.Record{
+		rec("p1", signal.KindPump, "M1", "AAA", 1_000_000, 100_000),
+		rec("p2", signal.KindPump, "M2", "BBB", 1_001_000, 110_000),
+		rec("p3", signal.KindPump, "M3", "CCC", 1_002_000, 120_000),
+		rec("m1", signal.KindMilestone, "M1", "AAA", 1_010_000, 150_000),
+	}
+	cfg := backtest.DefaultConfig()
+	cfg.EntryKinds = []string{signal.KindPump}
+	cfg.StartCash = 1
+	cfg.NotionalUSD = 0.05
+	cfg.FeeBps = 0
+	cfg.MinLiquidityUSD = 0
+	cfg.MinVolumeUSD1h = 0
+	cfg.LatencySec = 0
+	cfg.LatencySlipBps = 0
+	cfg.CloseOpenAtEnd = false
+	cfg.MaxPositions = 0
+	res, err := backtest.Run(recs, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.OpenCount < 3 {
+		t.Fatalf("want ≥3 open holds, got open=%d coins=%+v", res.OpenCount, res.Coins)
+	}
+	if res.Equity[len(res.Equity)-1].OpenPositions < 3 {
+		t.Fatalf("equity openPositions=%d", res.Equity[len(res.Equity)-1].OpenPositions)
+	}
+}
+
+func TestBankrollCapsConcurrentEntries(t *testing.T) {
+	recs := []signal.Record{
+		rec("p1", signal.KindPump, "M1", "AAA", 1_000_000, 100_000),
+		rec("p2", signal.KindPump, "M2", "BBB", 1_001_000, 110_000),
+		rec("p3", signal.KindPump, "M3", "CCC", 1_002_000, 120_000),
+	}
+	cfg := backtest.DefaultConfig()
+	cfg.EntryKinds = []string{signal.KindPump}
+	cfg.StartCash = 0.1
+	cfg.NotionalUSD = 0.05 // only 2 concurrent
+	cfg.FeeBps = 0
+	cfg.MinLiquidityUSD = 0
+	cfg.MinVolumeUSD1h = 0
+	cfg.LatencySec = 0
+	cfg.LatencySlipBps = 0
+	cfg.CloseOpenAtEnd = false
+	res, err := backtest.Run(recs, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.OpenCount != 2 {
+		t.Fatalf("want 2 open (bankroll cap), got %d coins=%+v skipped=%d", res.OpenCount, res.Coins, res.Skipped)
+	}
+	if res.Skipped < 1 {
+		t.Fatalf("want skipped cash-gated entry, got %d", res.Skipped)
+	}
+}
+
+func TestEodMarkIsClosedTrade(t *testing.T) {
+	recs := []signal.Record{
+		rec("p1", signal.KindPump, "M1", "AAA", 1_000_000, 100_000),
+		rec("m1", signal.KindMilestone, "M1", "AAA", 1_010_000, 120_000),
+	}
+	cfg := backtest.DefaultConfig()
+	cfg.EntryKinds = []string{signal.KindPump}
+	cfg.FeeBps = 0
+	cfg.MinLiquidityUSD = 0
+	cfg.MinVolumeUSD1h = 0
+	cfg.LatencySec = 0
+	cfg.LatencySlipBps = 0
+	cfg.CloseOpenAtEnd = true
+	res, err := backtest.Run(recs, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	found := false
+	for _, tr := range res.Trades {
+		if tr.ExitReason == "eod_mark" {
+			found = true
+			if tr.Open {
+				t.Fatalf("eod_mark must be closed (Open=false) for history, got %+v", tr)
+			}
+		}
+	}
+	if !found {
+		t.Fatalf("missing eod_mark in %+v", res.Trades)
+	}
+	if res.OpenCount != 0 {
+		t.Fatalf("want 0 open after eod, got %d", res.OpenCount)
+	}
+	if res.ClosedCount < 1 {
+		t.Fatalf("want closed coins, got %d", res.ClosedCount)
 	}
 }
 

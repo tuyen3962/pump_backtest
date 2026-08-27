@@ -31,14 +31,37 @@ func New(root string) (*Store, error) {
 }
 
 type SavedRun struct {
-	ID        string          `json:"id"`
-	SavedAt   time.Time       `json:"savedAt"`
-	Request   json.RawMessage `json:"request,omitempty"`
-	Response  json.RawMessage `json:"response"`
-	Source    string          `json:"source,omitempty"`
-	EndEquity float64         `json:"endEquity,omitempty"`
-	TotalPnL  float64         `json:"totalPnl,omitempty"`
-	CoinCount int             `json:"coinCount,omitempty"`
+	ID         string          `json:"id"`
+	Label      string          `json:"label,omitempty"`
+	SavedAt    time.Time       `json:"savedAt"`
+	Request    json.RawMessage `json:"request,omitempty"`
+	Response   json.RawMessage `json:"response"`
+	Source     string          `json:"source,omitempty"`
+	EndEquity  float64         `json:"endEquity,omitempty"`
+	TotalPnL   float64         `json:"totalPnl,omitempty"`
+	CoinCount  int             `json:"coinCount,omitempty"`
+	WinRate    float64         `json:"winRate,omitempty"`
+	MaxDDPct   float64         `json:"maxDrawdownPct,omitempty"`
+	OpenCount  int             `json:"openCount,omitempty"`
+	ClosedCount int            `json:"closedCount,omitempty"`
+	Signals    int             `json:"signals,omitempty"`
+	EntryKinds []string        `json:"entryKinds,omitempty"`
+}
+
+type RunSummary struct {
+	ID          string    `json:"id"`
+	Label       string    `json:"label,omitempty"`
+	SavedAt     time.Time `json:"savedAt"`
+	Source      string    `json:"source,omitempty"`
+	EndEquity   float64   `json:"endEquity"`
+	TotalPnL    float64   `json:"totalPnl"`
+	CoinCount   int       `json:"coinCount"`
+	WinRate     float64   `json:"winRate"`
+	MaxDDPct    float64   `json:"maxDrawdownPct"`
+	OpenCount   int       `json:"openCount"`
+	ClosedCount int       `json:"closedCount"`
+	Signals     int       `json:"signals"`
+	EntryKinds  []string  `json:"entryKinds,omitempty"`
 }
 
 type HistoryEntry struct {
@@ -100,6 +123,77 @@ func (s *Store) LoadLastRun() (*SavedRun, error) {
 		return nil, err
 	}
 	return &run, nil
+}
+
+func (s *Store) LoadRun(id string) (*SavedRun, error) {
+	id = strings.TrimSpace(id)
+	if id == "" {
+		return nil, os.ErrNotExist
+	}
+	// Prevent path traversal.
+	id = filepath.Base(id)
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	b, err := os.ReadFile(filepath.Join(s.Root, "runs", "run_"+id+".json"))
+	if err != nil {
+		return nil, err
+	}
+	var run SavedRun
+	if err := json.Unmarshal(b, &run); err != nil {
+		return nil, err
+	}
+	return &run, nil
+}
+
+// ListRuns returns newest-first run summaries (metadata only).
+func (s *Store) ListRuns(limit int) ([]RunSummary, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	dir := filepath.Join(s.Root, "runs")
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return []RunSummary{}, nil
+		}
+		return nil, err
+	}
+	var out []RunSummary
+	for _, e := range entries {
+		name := e.Name()
+		if e.IsDir() || !strings.HasPrefix(name, "run_") || !strings.HasSuffix(name, ".json") {
+			continue
+		}
+		b, err := os.ReadFile(filepath.Join(dir, name))
+		if err != nil {
+			continue
+		}
+		var run SavedRun
+		if err := json.Unmarshal(b, &run); err != nil {
+			continue
+		}
+		out = append(out, RunSummary{
+			ID:          run.ID,
+			Label:       run.Label,
+			SavedAt:     run.SavedAt,
+			Source:      run.Source,
+			EndEquity:   run.EndEquity,
+			TotalPnL:    run.TotalPnL,
+			CoinCount:   run.CoinCount,
+			WinRate:     run.WinRate,
+			MaxDDPct:    run.MaxDDPct,
+			OpenCount:   run.OpenCount,
+			ClosedCount: run.ClosedCount,
+			Signals:     run.Signals,
+			EntryKinds:  run.EntryKinds,
+		})
+	}
+	sort.Slice(out, func(i, j int) bool {
+		return out[i].SavedAt.After(out[j].SavedAt)
+	})
+	if limit > 0 && len(out) > limit {
+		out = out[:limit]
+	}
+	return out, nil
 }
 
 func (s *Store) AppendHistory(entries []HistoryEntry) error {

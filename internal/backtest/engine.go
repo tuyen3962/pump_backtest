@@ -9,15 +9,16 @@ import (
 	"github.com/surt/pump_backtest/internal/signal"
 )
 
-// Config controls strategy v1 (whale_armed experimental).
+// Config controls strategy v1 (pump fire by default).
 // Units default to SOL for bankroll / size (StartCash=1, Notional=0.05).
 // Price proxy remains market-cap USD from signals (ratio ≈ price return).
+// Entry fill uses signal mcap (for pump ≈ fireEntryMcap); TP/SL are vs that fill.
 type Config struct {
 	StartCash      float64  `json:"startCash"`
 	EntryKinds     []string `json:"entryKinds"`
 	NotionalUSD    float64  `json:"notionalUsd"` // size per entry (SOL in v1)
 	FeeBps         float64  `json:"feeBps"`
-	MaxPositions   int      `json:"maxPositions"`
+	MaxPositions   int      `json:"maxPositions"` // 0 = unlimited (still capped by free bankroll)
 	CloseOpenAtEnd bool     `json:"closeOpenAtEnd"`
 
 	// ExitOutTriggers: close remaining on these out.trigger values.
@@ -57,11 +58,11 @@ type MarketSnapshot struct {
 func DefaultConfig() Config {
 	return Config{
 		StartCash:         1,    // 1 SOL bankroll
-		NotionalUSD:       0.05, // 0.05 SOL / trade
-		EntryKinds:        []string{signal.KindWhaleArmed},
+		NotionalUSD:       0.05, // 0.05 SOL / trade → up to 20 concurrent if cash-gated
+		EntryKinds:        []string{signal.KindPump},
 		FeeBps:            100, // ~1% round-trip friction proxy
-		MaxPositions:      0,
-		CloseOpenAtEnd:    true,
+		MaxPositions:      0,   // 0 = no count cap (bankroll still limits)
+		CloseOpenAtEnd:    false, // keep open for dashboard follow / multi-hold
 		ExitOutTriggers:   []string{"stale", "dev_sold", "whale_dump"},
 		AlsoExitMustOut:   true,
 		StopLossPct:       60,
@@ -367,6 +368,14 @@ func RunWithMarket(records []signal.Record, cfg Config, market map[string]Market
 			continue
 		}
 		if cfg.MaxPositions > 0 && countOpen(positions) >= cfg.MaxPositions {
+			skipped++
+			continue
+		}
+		// Reserve notional from bankroll so multiple concurrent holds share StartCash.
+		deployed := deployedNotional(positions)
+		freeCash := cfg.StartCash + realized - deployed
+		if freeCash+1e-12 < cfg.NotionalUSD {
+			skipped++
 			continue
 		}
 		if !passMarketGate(mint, market, cfg) {
@@ -413,7 +422,7 @@ func RunWithMarket(records []signal.Record, cfg Config, market map[string]Market
 			if exitMcap <= 0 {
 				exitMcap = pos.entry.Mcap
 			}
-			closeAll(mint, sellFill(pos.lastTime, mint, pos.entry.Symbol, pos.lastKind, exitMcap, pos.lastSigID), "eod_mark", true)
+			closeAll(mint, sellFill(pos.lastTime, mint, pos.entry.Symbol, pos.lastKind, exitMcap, pos.lastSigID), "eod_mark", false)
 		}
 	}
 
@@ -428,7 +437,28 @@ func RunWithMarket(records []signal.Record, cfg Config, market map[string]Market
 	}
 	finalizeStats(&res)
 	res.Coins = aggregateCoins(trades, positions)
+	// Open/closed counts from coin rows (includes never-exited holds).
+	res.OpenCount = 0
+	res.ClosedCount = 0
+	for _, c := range res.Coins {
+		if c.Open {
+			res.OpenCount++
+		} else {
+			res.ClosedCount++
+		}
+	}
 	return res, nil
+}
+
+func deployedNotional(positions map[string]*position) float64 {
+	var sum float64
+	for _, p := range positions {
+		if p == nil || p.remaining <= 1e-9 {
+			continue
+		}
+		sum += p.sizeSOL * p.remaining
+	}
+	return sum
 }
 
 func applyConfigDefaults(cfg Config) Config {
@@ -572,11 +602,6 @@ func finalizeStats(res *Result) {
 	for _, t := range res.Trades {
 		res.TotalPnL += t.PnLUSD
 		sumRet += t.ReturnPct
-		if t.Open {
-			res.OpenCount++
-		} else {
-			res.ClosedCount++
-		}
 		if t.PnLUSD >= 0 {
 			res.Wins++
 		} else {

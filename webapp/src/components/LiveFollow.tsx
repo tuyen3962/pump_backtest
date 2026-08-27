@@ -28,7 +28,7 @@ export function LiveFollow({ stream }: Props) {
         </span>
       </div>
       <p className="panel-note">
-        Coin open sau backtest (kể cả eod_mark) được push mcap/vol/rug khi dashboard đang mở.
+        Coin đóng bằng eod_mark vẫn có thể nằm Follow để xem mcap/vol/rug khi dashboard mở.
       </p>
       {error ? <div className="err">{error}</div> : null}
       {!items.length ? (

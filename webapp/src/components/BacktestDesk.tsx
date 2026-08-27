@@ -1,8 +1,10 @@
 import { useEffect, useMemo, useState } from "react";
 import {
   fetchLastBacktest,
+  fetchRun,
   fetchSources,
   runBacktest,
+  type BacktestRequest,
   type BacktestResponse,
   type FollowRow,
   type Source,
@@ -11,7 +13,7 @@ import { pnlClass } from "../format";
 import { CoinTable } from "./CoinTable";
 import { EquityChart } from "./EquityChart";
 
-const ENTRY_OPTIONS = ["whale_armed", "pump", "arm", "whale", "milestone"] as const;
+const ENTRY_OPTIONS = ["pump", "whale_armed", "arm", "whale", "milestone"] as const;
 
 function sol(n: number | undefined | null, digits = 4): string {
   const v = Number(n ?? 0);
@@ -21,13 +23,16 @@ function sol(n: number | undefined | null, digits = 4): string {
 
 type Props = {
   onRunComplete?: () => void;
+  onDraftChange?: (draft: BacktestRequest) => void;
   liveByMint?: Record<string, FollowRow>;
+  loadRunId?: string | null;
 };
 
-export function BacktestDesk({ onRunComplete, liveByMint }: Props) {
+export function BacktestDesk({ onRunComplete, onDraftChange, liveByMint, loadRunId }: Props) {
   const [sources, setSources] = useState<Source[]>([]);
   const [source, setSource] = useState("live");
-  const [entryKinds, setEntryKinds] = useState<string[]>(["whale_armed"]);
+  const [runLabel, setRunLabel] = useState("");
+  const [entryKinds, setEntryKinds] = useState<string[]>(["pump"]);
   const [startCash, setStartCash] = useState(1);
   const [notional, setNotional] = useState(0.05);
   const [feeBps, setFeeBps] = useState(100);
@@ -35,7 +40,9 @@ export function BacktestDesk({ onRunComplete, liveByMint }: Props) {
   const [minLiq, setMinLiq] = useState(5000);
   const [minVol1h, setMinVol1h] = useState(2000);
   const [maxPos, setMaxPos] = useState(0);
-  const [closeEod, setCloseEod] = useState(true);
+  const [closeEod, setCloseEod] = useState(false);
+  const [stopLoss, setStopLoss] = useState(60);
+  const [takeProfit, setTakeProfit] = useState(2);
   const [enrich, setEnrich] = useState(true);
   const [sampleLive, setSampleLive] = useState(false);
   const [disableFilters, setDisableFilters] = useState(false);
@@ -43,6 +50,53 @@ export function BacktestDesk({ onRunComplete, liveByMint }: Props) {
   const [error, setError] = useState("");
   const [savedAt, setSavedAt] = useState("");
   const [data, setData] = useState<BacktestResponse | null>(null);
+
+  const draft: BacktestRequest = useMemo(
+    () => ({
+      source,
+      label: runLabel.trim() || undefined,
+      entryKinds,
+      startCash,
+      notionalUsd: notional,
+      feeBps,
+      maxPositions: maxPos,
+      closeOpenAtEnd: closeEod,
+      enrichTokens: enrich,
+      sampleLive,
+      alsoExitMustOut: true,
+      minLiquidityUsd: minLiq,
+      minVolumeUsd1h: minVol1h,
+      latencySec: latency,
+      stopLossPct: stopLoss,
+      scaleTriggerPct: 15,
+      takeProfit2x: takeProfit,
+      disableFilters,
+      exitMustOut: true,
+      exitWatchOut: false,
+    }),
+    [
+      source,
+      runLabel,
+      entryKinds,
+      startCash,
+      notional,
+      feeBps,
+      maxPos,
+      closeEod,
+      enrich,
+      sampleLive,
+      minLiq,
+      minVol1h,
+      latency,
+      stopLoss,
+      takeProfit,
+      disableFilters,
+    ],
+  );
+
+  useEffect(() => {
+    onDraftChange?.(draft);
+  }, [draft, onDraftChange]);
 
   useEffect(() => {
     fetchSources()
@@ -58,12 +112,38 @@ export function BacktestDesk({ onRunComplete, liveByMint }: Props) {
         if (last.found && last.run) {
           setData(last.run);
           setSavedAt(last.savedAt || last.run.updated || "");
+          const cfg = last.run.result?.config;
+          if (cfg?.entryKinds?.length) setEntryKinds(cfg.entryKinds);
+          if (cfg?.startCash) setStartCash(cfg.startCash);
+          if (cfg?.notionalUsd) setNotional(cfg.notionalUsd);
+          if (cfg?.stopLossPct) setStopLoss(cfg.stopLossPct);
         }
       })
       .catch(() => {
         /* no prior run is fine */
       });
   }, []);
+
+  useEffect(() => {
+    if (!loadRunId) return;
+    void (async () => {
+      try {
+        const packed = await fetchRun(loadRunId);
+        setData(packed.run);
+        setSavedAt(packed.savedAt || packed.run.updated || "");
+        setRunLabel(packed.label || "");
+        const cfg = packed.run.result?.config;
+        if (cfg?.entryKinds?.length) setEntryKinds(cfg.entryKinds);
+        if (cfg?.startCash) setStartCash(cfg.startCash);
+        if (cfg?.notionalUsd) setNotional(cfg.notionalUsd);
+        if (cfg?.feeBps != null) setFeeBps(cfg.feeBps);
+        if (cfg?.latencySec != null) setLatency(cfg.latencySec);
+        if (cfg?.stopLossPct) setStopLoss(cfg.stopLossPct);
+      } catch (err) {
+        setError(String((err as Error).message || err));
+      }
+    })();
+  }, [loadRunId]);
 
   const result = data?.result;
   const stats = useMemo(() => {
@@ -95,27 +175,7 @@ export function BacktestDesk({ onRunComplete, liveByMint }: Props) {
     setLoading(true);
     setError("");
     try {
-      const res = await runBacktest({
-        source,
-        entryKinds,
-        startCash,
-        notionalUsd: notional,
-        feeBps,
-        maxPositions: maxPos,
-        closeOpenAtEnd: closeEod,
-        enrichTokens: enrich,
-        sampleLive,
-        alsoExitMustOut: true,
-        minLiquidityUsd: minLiq,
-        minVolumeUsd1h: minVol1h,
-        latencySec: latency,
-        stopLossPct: 60,
-        scaleTriggerPct: 15,
-        disableFilters,
-        // legacy unused
-        exitMustOut: true,
-        exitWatchOut: false,
-      });
+      const res = await runBacktest({ ...draft, async: false, updateWatchlist: true });
       setData(res);
       setSavedAt(res.updated || new Date().toISOString());
       onRunComplete?.();
@@ -132,8 +192,17 @@ export function BacktestDesk({ onRunComplete, liveByMint }: Props) {
         <aside className="panel sticky">
           <h2>Strategy v1</h2>
           <p className="panel-note">
-            Entry <code>whale_armed</code> · stop -60% · TP 2x bán ½ · scale +15% · out stale/dev_sold/whale_dump
+            Entry <code>pump</code> (fire fill) · multi-hold theo bankroll · dùng Lab bên dưới để
+            queue nhiều variant song song + CSV.
           </p>
+
+          <label htmlFor="runLabel">Label (lưu run)</label>
+          <input
+            id="runLabel"
+            value={runLabel}
+            placeholder="vd: pump baseline"
+            onChange={(e) => setRunLabel(e.target.value)}
+          />
 
           <label htmlFor="source">Nguồn data</label>
           <select id="source" value={source} onChange={(e) => setSource(e.target.value)}>
@@ -178,6 +247,26 @@ export function BacktestDesk({ onRunComplete, liveByMint }: Props) {
             onChange={(e) => setNotional(Number(e.target.value))}
           />
 
+          <label htmlFor="stopLoss">Stop loss (%)</label>
+          <input
+            id="stopLoss"
+            type="number"
+            value={stopLoss}
+            min={5}
+            step={5}
+            onChange={(e) => setStopLoss(Number(e.target.value))}
+          />
+
+          <label htmlFor="takeProfit">Take profit (×)</label>
+          <input
+            id="takeProfit"
+            type="number"
+            value={takeProfit}
+            min={1.1}
+            step={0.1}
+            onChange={(e) => setTakeProfit(Number(e.target.value))}
+          />
+
           <label htmlFor="latency">Latency entry (giây)</label>
           <input
             id="latency"
@@ -218,7 +307,7 @@ export function BacktestDesk({ onRunComplete, liveByMint }: Props) {
             onChange={(e) => setMinVol1h(Number(e.target.value))}
           />
 
-          <label htmlFor="maxPos">Max concurrent (0 = ∞)</label>
+          <label htmlFor="maxPos">Max concurrent (0 = chỉ giới hạn bankroll)</label>
           <input
             id="maxPos"
             type="number"
@@ -227,11 +316,15 @@ export function BacktestDesk({ onRunComplete, liveByMint }: Props) {
             step={1}
             onChange={(e) => setMaxPos(Number(e.target.value))}
           />
+          <p className="panel-note" style={{ marginTop: 4 }}>
+            Free cash ≥ size mới mở thêm · bankroll {startCash} / size {notional} → ~{" "}
+            {notional > 0 ? Math.floor(startCash / notional) : 0} lệnh đồng thời.
+          </p>
 
           <div className="checks" style={{ marginTop: 14 }}>
             <label>
               <input type="checkbox" checked={closeEod} onChange={(e) => setCloseEod(e.target.checked)} />
-              Mark-to-market open at end
+              Đóng / MTM hết lệnh mở khi hết data
             </label>
             <label>
               <input type="checkbox" checked={enrich} onChange={(e) => setEnrich(e.target.checked)} />
@@ -256,7 +349,7 @@ export function BacktestDesk({ onRunComplete, liveByMint }: Props) {
           </div>
 
           <button className="run" onClick={() => void run()} disabled={loading}>
-            {loading ? "Đang chạy…" : "Chạy backtest"}
+            {loading ? "Đang chạy…" : "Chạy backtest (sync)"}
           </button>
           {error ? <div className="err">{error}</div> : null}
         </aside>
@@ -301,7 +394,12 @@ export function BacktestDesk({ onRunComplete, liveByMint }: Props) {
                 </span>
               ) : null}
             </div>
-            <CoinTable coins={result?.coins || []} unit="SOL" liveByMint={liveByMint} />
+            <CoinTable
+              coins={result?.coins || []}
+              unit="SOL"
+              liveByMint={liveByMint}
+              notionalSol={result?.config?.notionalUsd ?? 0.05}
+            />
           </div>
         </div>
       </div>

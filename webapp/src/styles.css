@@ -435,3 +435,41 @@ button.linkish:hover {
   color: var(--accent);
 }
 
+.runs-lab {
+  margin: 18px 0;
+}
+
+.runs-queue-row {
+  display: flex;
+  gap: 10px;
+  align-items: center;
+}
+
+.runs-queue-row input {
+  flex: 1;
+}
+
+.jobs-live {
+  display: grid;
+  gap: 6px;
+  margin: 10px 0;
+}
+
+.job-row {
+  display: flex;
+  gap: 10px;
+  align-items: center;
+  flex-wrap: wrap;
+  font-size: 0.9rem;
+}
+
+.csv-links a {
+  color: var(--accent);
+  text-decoration: none;
+  font-weight: 600;
+}
+
+.csv-links a:hover {
+  text-decoration: underline;
+}
+
