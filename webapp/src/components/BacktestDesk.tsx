@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   enqueueBacktest,
   fetchJob,
@@ -27,6 +27,39 @@ function sol(n: number | undefined | null, digits = 4): string {
 function toLocalInput(d: Date): string {
   const pad = (n: number) => String(n).padStart(2, "0");
   return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}T${pad(d.getHours())}:${pad(d.getMinutes())}`;
+}
+
+/** Historical NDJSON files — auto-run when selected. */
+function isStaticSource(id: string): boolean {
+  return id === "demo" || id.startsWith("file:");
+}
+
+function matchesSource(sourceId: string, responsePath: string, sources: Source[]): boolean {
+  const s = sources.find((x) => x.id === sourceId);
+  if (!s || !responsePath) return false;
+  if (responsePath === s.path) return true;
+  const base = s.path.split("/").pop();
+  return !!base && (responsePath.endsWith("/" + base) || responsePath.endsWith(base));
+}
+
+function applyConfigFromResult(
+  cfg: BacktestResponse["result"]["config"] | undefined,
+  setters: {
+    setEntryKinds: (v: string[]) => void;
+    setStartCash: (v: number) => void;
+    setNotional: (v: number) => void;
+    setFeeBps: (v: number) => void;
+    setLatency: (v: number) => void;
+    setStopLoss: (v: number) => void;
+  },
+) {
+  if (!cfg) return;
+  if (cfg.entryKinds?.length) setters.setEntryKinds(cfg.entryKinds);
+  if (cfg.startCash) setters.setStartCash(cfg.startCash);
+  if (cfg.notionalUsd) setters.setNotional(cfg.notionalUsd);
+  if (cfg.feeBps != null) setters.setFeeBps(cfg.feeBps);
+  if (cfg.latencySec != null) setters.setLatency(cfg.latencySec);
+  if (cfg.stopLossPct) setters.setStopLoss(cfg.stopLossPct);
 }
 
 type Props = {
@@ -64,6 +97,20 @@ export function BacktestDesk({ onRunComplete, onDraftChange, liveByMint, loadRun
   const [error, setError] = useState("");
   const [savedAt, setSavedAt] = useState("");
   const [data, setData] = useState<BacktestResponse | null>(null);
+  const runSeqRef = useRef(0);
+  const prevSourceRef = useRef<string | null>(null);
+
+  const configSetters = useMemo(
+    () => ({
+      setEntryKinds,
+      setStartCash,
+      setNotional,
+      setFeeBps,
+      setLatency,
+      setStopLoss,
+    }),
+    [],
+  );
 
   const draft: BacktestRequest = useMemo(
     () => ({
@@ -120,6 +167,40 @@ export function BacktestDesk({ onRunComplete, onDraftChange, liveByMint, loadRun
     onDraftChange?.(draft);
   }, [draft, onDraftChange]);
 
+  const runForSource = useCallback(
+    async (sourceId: string, opts?: { fromTime?: string; toTime?: string }) => {
+      if (!entryKinds.length) {
+        setError("Chọn ít nhất 1 entry kind");
+        return;
+      }
+      const seq = ++runSeqRef.current;
+      setLoading(true);
+      setError("");
+      try {
+        const staticSrc = isStaticSource(sourceId);
+        const res = await runBacktest({
+          ...draft,
+          source: sourceId,
+          fromTime: staticSrc ? undefined : opts?.fromTime ?? (fromTime || undefined),
+          toTime: staticSrc ? undefined : opts?.toTime ?? (toTime || undefined),
+          sessionEndAt: undefined,
+          async: false,
+          updateWatchlist: true,
+        });
+        if (seq !== runSeqRef.current) return;
+        setData(res);
+        setSavedAt(res.updated || new Date().toISOString());
+        onRunComplete?.();
+      } catch (err) {
+        if (seq !== runSeqRef.current) return;
+        setError(String((err as Error).message || err));
+      } finally {
+        if (seq === runSeqRef.current) setLoading(false);
+      }
+    },
+    [draft, entryKinds.length, fromTime, toTime, onRunComplete],
+  );
+
   useEffect(() => {
     fetchSources()
       .then((list) => {
@@ -128,23 +209,51 @@ export function BacktestDesk({ onRunComplete, onDraftChange, liveByMint, loadRun
         else if (list[0]) setSource(list[0].id);
       })
       .catch((err) => setError(String(err.message || err)));
+  }, []);
 
-    fetchLastBacktest()
-      .then((last) => {
-        if (last.found && last.run) {
+  // Auto-run static signal files on switch; live waits for manual start / session.
+  useEffect(() => {
+    if (!sources.length) return;
+
+    const prev = prevSourceRef.current;
+    prevSourceRef.current = source;
+
+    if (prev === null) {
+      if (isStaticSource(source)) {
+        void runForSource(source);
+        return;
+      }
+      void (async () => {
+        try {
+          const last = await fetchLastBacktest();
+          if (!last.found || !last.run) return;
+          if (!matchesSource(source, last.run.source, sources)) return;
           setData(last.run);
           setSavedAt(last.savedAt || last.run.updated || "");
-          const cfg = last.run.result?.config;
-          if (cfg?.entryKinds?.length) setEntryKinds(cfg.entryKinds);
-          if (cfg?.startCash) setStartCash(cfg.startCash);
-          if (cfg?.notionalUsd) setNotional(cfg.notionalUsd);
-          if (cfg?.stopLossPct) setStopLoss(cfg.stopLossPct);
+          applyConfigFromResult(last.run.result?.config, configSetters);
+        } catch {
+          /* no prior run */
         }
-      })
-      .catch(() => {
-        /* no prior run is fine */
-      });
-  }, []);
+      })();
+      return;
+    }
+
+    if (prev === source) return;
+
+    ++runSeqRef.current;
+    setError("");
+
+    if (isStaticSource(source)) {
+      setFromTime("");
+      setToTime("");
+      setSessionEndAt("");
+      void runForSource(source);
+      return;
+    }
+
+    setData(null);
+    setSavedAt("");
+  }, [source, sources, runForSource, configSetters]);
 
   useEffect(() => {
     if (!loadRunId) return;
@@ -154,18 +263,16 @@ export function BacktestDesk({ onRunComplete, onDraftChange, liveByMint, loadRun
         setData(packed.run);
         setSavedAt(packed.savedAt || packed.run.updated || "");
         setRunLabel(packed.label || "");
-        const cfg = packed.run.result?.config;
-        if (cfg?.entryKinds?.length) setEntryKinds(cfg.entryKinds);
-        if (cfg?.startCash) setStartCash(cfg.startCash);
-        if (cfg?.notionalUsd) setNotional(cfg.notionalUsd);
-        if (cfg?.feeBps != null) setFeeBps(cfg.feeBps);
-        if (cfg?.latencySec != null) setLatency(cfg.latencySec);
-        if (cfg?.stopLossPct) setStopLoss(cfg.stopLossPct);
+        applyConfigFromResult(packed.run.result?.config, configSetters);
       } catch (err) {
         setError(String((err as Error).message || err));
       }
     })();
-  }, [loadRunId]);
+  }, [loadRunId, configSetters]);
+
+  const sourceLabel = sources.find((s) => s.id === source)?.label || source;
+  const dataStale =
+    !!data && sources.length > 0 && !matchesSource(source, data.source, sources);
 
   // Poll stability session job + refresh run snapshot
   useEffect(() => {
@@ -246,27 +353,12 @@ export function BacktestDesk({ onRunComplete, onDraftChange, liveByMint, loadRun
   }
 
   async function run() {
-    if (!entryKinds.length) {
-      setError("Chọn ít nhất 1 entry kind");
-      return;
-    }
-    setLoading(true);
-    setError("");
-    try {
-      const res = await runBacktest({
-        ...draft,
-        sessionEndAt: undefined,
-        async: false,
-        updateWatchlist: true,
-      });
-      setData(res);
-      setSavedAt(res.updated || new Date().toISOString());
-      onRunComplete?.();
-    } catch (err) {
-      setError(String((err as Error).message || err));
-    } finally {
-      setLoading(false);
-    }
+    await runForSource(source);
+  }
+
+  function handleSourceChange(next: string) {
+    if (next === source || loading || sessionJobId) return;
+    setSource(next);
   }
 
   async function startSession() {
@@ -324,13 +416,28 @@ export function BacktestDesk({ onRunComplete, onDraftChange, liveByMint, loadRun
           />
 
           <label htmlFor="source">Nguồn data</label>
-          <select id="source" value={source} onChange={(e) => setSource(e.target.value)}>
+          <select
+            id="source"
+            value={source}
+            disabled={loading || !!sessionJobId}
+            onChange={(e) => handleSourceChange(e.target.value)}
+          >
             {sources.map((s) => (
               <option key={s.id} value={s.id}>
                 {s.label}
               </option>
             ))}
           </select>
+          {source === "live" && !loading && !data ? (
+            <p className="panel-note" style={{ marginTop: 4 }}>
+              Live: chỉnh config rồi bấm Chạy hoặc Bắt đầu session — không tự chạy khi chọn.
+            </p>
+          ) : null}
+          {loading && isStaticSource(source) ? (
+            <p className="panel-note" style={{ marginTop: 4 }}>
+              Đang chạy backtest <strong>{sourceLabel}</strong>…
+            </p>
+          ) : null}
 
           <label>Entry kinds</label>
           <div className="checks">
@@ -519,8 +626,13 @@ export function BacktestDesk({ onRunComplete, onDraftChange, liveByMint, loadRun
               <strong>Balance (SOL)</strong>
               <span>
                 {data
-                  ? `${data.loaded} signals · ${result?.coins?.length || 0} coins · skip ${result?.skippedEntries ?? 0}`
-                  : "—"}
+                  ? `${sourceLabel} · ${data.loaded} signals · ${result?.coins?.length || 0} coins · skip ${result?.skippedEntries ?? 0}`
+                  : loading
+                    ? `${sourceLabel} · đang chạy…`
+                    : source === "live"
+                      ? `${sourceLabel} · chưa chạy`
+                      : "—"}
+                {dataStale ? " · ⚠ data cũ" : ""}
                 {savedAt ? ` · saved ${new Date(savedAt).toLocaleString()}` : ""}
               </span>
             </div>

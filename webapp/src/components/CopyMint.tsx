@@ -1,4 +1,5 @@
 import { useState, type MouseEvent } from "react";
+import { copyToClipboard } from "../format";
 
 type Props = {
   mint: string;
@@ -7,25 +8,29 @@ type Props = {
 
 export function CopyMint({ mint, className }: Props) {
   const [ok, setOk] = useState(false);
+  const [fail, setFail] = useState(false);
   if (!mint) return null;
 
   async function copy(e: MouseEvent) {
     e.preventDefault();
     e.stopPropagation();
-    try {
-      await navigator.clipboard.writeText(mint);
+    const success = await copyToClipboard(mint);
+    if (success) {
+      setFail(false);
       setOk(true);
       window.setTimeout(() => setOk(false), 1200);
-    } catch {
-      /* ignore */
+    } else {
+      setOk(false);
+      setFail(true);
+      window.setTimeout(() => setFail(false), 2000);
     }
   }
 
   return (
     <button
       type="button"
-      className={`copy-mint ${className || ""}`}
-      title={ok ? "Đã copy" : "Copy contract"}
+      className={`copy-mint ${fail ? "copy-mint-fail" : ""} ${className || ""}`}
+      title={ok ? "Đã copy" : fail ? "Copy thất bại" : `Copy: ${mint}`}
       aria-label="Copy contract"
       onClick={(e) => void copy(e)}
     >
