@@ -99,7 +99,7 @@ func (s *Store) SaveRun(run SavedRun) error {
 	if run.SavedAt.IsZero() {
 		run.SavedAt = time.Now().UTC()
 	}
-	b, err := json.MarshalIndent(run, "", "  ")
+	b, err := json.Marshal(run)
 	if err != nil {
 		return err
 	}
@@ -108,7 +108,10 @@ func (s *Store) SaveRun(run SavedRun) error {
 	if err := os.WriteFile(last, b, 0o644); err != nil {
 		return err
 	}
-	return os.WriteFile(archive, b, 0o644)
+	if err := os.WriteFile(archive, b, 0o644); err != nil {
+		return err
+	}
+	return s.upsertRunIndexLocked(metaFromRun(run))
 }
 
 func (s *Store) LoadLastRun() (*SavedRun, error) {
@@ -145,51 +148,14 @@ func (s *Store) LoadRun(id string) (*SavedRun, error) {
 	return &run, nil
 }
 
-// ListRuns returns newest-first run summaries (metadata only).
+// ListRuns returns newest-first run summaries from index.json (fast).
 func (s *Store) ListRuns(limit int) ([]RunSummary, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	dir := filepath.Join(s.Root, "runs")
-	entries, err := os.ReadDir(dir)
+	out, err := s.loadRunIndexLocked()
 	if err != nil {
-		if os.IsNotExist(err) {
-			return []RunSummary{}, nil
-		}
 		return nil, err
 	}
-	var out []RunSummary
-	for _, e := range entries {
-		name := e.Name()
-		if e.IsDir() || !strings.HasPrefix(name, "run_") || !strings.HasSuffix(name, ".json") {
-			continue
-		}
-		b, err := os.ReadFile(filepath.Join(dir, name))
-		if err != nil {
-			continue
-		}
-		var run SavedRun
-		if err := json.Unmarshal(b, &run); err != nil {
-			continue
-		}
-		out = append(out, RunSummary{
-			ID:          run.ID,
-			Label:       run.Label,
-			SavedAt:     run.SavedAt,
-			Source:      run.Source,
-			EndEquity:   run.EndEquity,
-			TotalPnL:    run.TotalPnL,
-			CoinCount:   run.CoinCount,
-			WinRate:     run.WinRate,
-			MaxDDPct:    run.MaxDDPct,
-			OpenCount:   run.OpenCount,
-			ClosedCount: run.ClosedCount,
-			Signals:     run.Signals,
-			EntryKinds:  run.EntryKinds,
-		})
-	}
-	sort.Slice(out, func(i, j int) bool {
-		return out[i].SavedAt.After(out[j].SavedAt)
-	})
 	if limit > 0 && len(out) > limit {
 		out = out[:limit]
 	}
@@ -207,6 +173,8 @@ func (s *Store) DeleteRun(id string) error {
 	if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
 		return err
 	}
+	_ = os.Remove(s.runDetailPath(id))
+	_ = s.removeFromRunIndexLocked(id)
 	lastPath := filepath.Join(s.Root, "runs", "last.json")
 	b, err := os.ReadFile(lastPath)
 	if err == nil {
@@ -258,11 +226,13 @@ func (s *Store) DeleteRunsBefore(cutoff time.Time) (int, error) {
 		if err := os.Remove(p); err != nil {
 			continue
 		}
+		_ = os.Remove(s.runDetailPath(run.ID))
 		n++
 		if run.ID == lastID {
 			_ = os.Remove(filepath.Join(dir, "last.json"))
 		}
 	}
+	_, _ = s.rebuildRunIndexLocked()
 	return n, nil
 }
 

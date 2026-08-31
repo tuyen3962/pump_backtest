@@ -233,6 +233,25 @@ async function readError(res: Response): Promise<string> {
   return text || res.statusText;
 }
 
+/** Convert datetime-local (browser TZ) to RFC3339 UTC for the API. */
+function toRFC3339(v?: string): string | undefined {
+  if (!v?.trim()) return undefined;
+  const s = v.trim();
+  if (/Z$/i.test(s) || /[+-]\d{2}:\d{2}$/.test(s)) return s;
+  const d = new Date(s);
+  if (Number.isNaN(d.getTime())) return s;
+  return d.toISOString();
+}
+
+function withNormalizedTimes(body: BacktestRequest): BacktestRequest {
+  return {
+    ...body,
+    fromTime: toRFC3339(body.fromTime),
+    toTime: toRFC3339(body.toTime),
+    sessionEndAt: toRFC3339(body.sessionEndAt),
+  };
+}
+
 export async function fetchSources(): Promise<Source[]> {
   const res = await fetch("/api/sources");
   if (!res.ok) throw new Error(await readError(res));
@@ -251,7 +270,7 @@ export async function runBacktest(body: BacktestRequest): Promise<BacktestRespon
   const res = await fetch("/api/backtest", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ ...body, async: false }),
+    body: JSON.stringify({ ...withNormalizedTimes(body), async: false }),
   });
   if (!res.ok) throw new Error(await readError(res));
   return res.json();
@@ -262,7 +281,7 @@ export async function enqueueBacktest(body: BacktestRequest): Promise<{ job: Job
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({
-      ...body,
+      ...withNormalizedTimes(body),
       async: true,
       updateWatchlist: body.updateWatchlist ?? false,
     }),

@@ -6,7 +6,6 @@ import {
   enqueueBacktest,
   exportRunCsvUrl,
   fetchJobs,
-  fetchRun,
   fetchRuns,
   pruneRunsBefore,
   type BacktestRequest,
@@ -127,12 +126,7 @@ export function RunsLab({ draft, onLoadRun, refreshKey = 0 }: Props) {
   }
 
   async function openRun(id: string) {
-    try {
-      await fetchRun(id);
-      onLoadRun?.(id);
-    } catch (err) {
-      setError(String((err as Error).message || err));
-    }
+    onLoadRun?.(id);
   }
 
   async function removeRun(id: string) {

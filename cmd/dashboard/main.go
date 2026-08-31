@@ -183,6 +183,9 @@ func handleLastBacktest(w http.ResponseWriter, st *store.Store) {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
+	if m, ok := resp.(map[string]any); ok {
+		resp = slimRunPayloadForAPI(m)
+	}
 	writeJSON(w, map[string]any{
 		"found":   true,
 		"id":      run.ID,
@@ -334,7 +337,7 @@ func handleCompareRuns(w http.ResponseWriter, r *http.Request, st *store.Store) 
 		if err != nil {
 			continue
 		}
-		res, _, err := resultFromSaved(run)
+		res, _, err := resultFromSaved(run, st)
 		if err != nil {
 			rows = append(rows, row{
 				ID: run.ID, Label: run.Label, Source: run.Source,
@@ -391,7 +394,7 @@ func handleRunByID(w http.ResponseWriter, r *http.Request, st *store.Store) {
 			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 			return
 		}
-		res, _, err := resultFromSaved(run)
+		res, _, err := resultFromSaved(run, st)
 		if err != nil {
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return
@@ -433,6 +436,9 @@ func handleRunByID(w http.ResponseWriter, r *http.Request, st *store.Store) {
 	if err := json.Unmarshal(run.Response, &resp); err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
+	}
+	if m, ok := resp.(map[string]any); ok {
+		resp = slimRunPayloadForAPI(m)
 	}
 	writeJSON(w, map[string]any{
 		"id":      run.ID,
@@ -727,9 +733,7 @@ func readBody(r *http.Request) ([]byte, error) {
 
 func writeJSON(w http.ResponseWriter, v any) {
 	w.Header().Set("Content-Type", "application/json")
-	enc := json.NewEncoder(w)
-	enc.SetIndent("", "  ")
-	if err := enc.Encode(v); err != nil {
+	if err := json.NewEncoder(w).Encode(v); err != nil {
 		log.Printf("json encode: %v", err)
 	}
 }

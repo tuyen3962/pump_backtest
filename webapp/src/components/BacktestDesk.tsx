@@ -94,6 +94,7 @@ export function BacktestDesk({ onRunComplete, onDraftChange, liveByMint, loadRun
   const [sessionJobId, setSessionJobId] = useState<string | null>(null);
   const [sessionProgress, setSessionProgress] = useState("");
   const [loading, setLoading] = useState(false);
+  const [loadingRun, setLoadingRun] = useState(false);
   const [error, setError] = useState("");
   const [savedAt, setSavedAt] = useState("");
   const [data, setData] = useState<BacktestResponse | null>(null);
@@ -258,6 +259,8 @@ export function BacktestDesk({ onRunComplete, onDraftChange, liveByMint, loadRun
   useEffect(() => {
     if (!loadRunId) return;
     void (async () => {
+      setLoadingRun(true);
+      setError("");
       try {
         const packed = await fetchRun(loadRunId);
         setData(packed.run);
@@ -266,6 +269,8 @@ export function BacktestDesk({ onRunComplete, onDraftChange, liveByMint, loadRun
         applyConfigFromResult(packed.run.result?.config, configSetters);
       } catch (err) {
         setError(String((err as Error).message || err));
+      } finally {
+        setLoadingRun(false);
       }
     })();
   }, [loadRunId, configSetters]);
@@ -290,8 +295,13 @@ export function BacktestDesk({ onRunComplete, onDraftChange, liveByMint, loadRun
           if (job.status === "done" || job.status === "failed" || job.status === "cancelled") {
             setSessionJobId(null);
             setLoading(false);
-            if (job.status === "failed") setError(job.error || "session failed");
-            else onRunComplete?.();
+            if (job.status === "done") {
+              setSessionEndAt("");
+              setSessionProgress("session complete");
+              onRunComplete?.();
+            } else if (job.status === "failed") {
+              setError(job.error || "session failed");
+            }
           }
         } catch (err) {
           setError(String((err as Error).message || err));
@@ -576,8 +586,8 @@ export function BacktestDesk({ onRunComplete, onDraftChange, liveByMint, loadRun
             </label>
           </div>
 
-          <button className="run" onClick={() => void run()} disabled={loading || !!sessionJobId}>
-            {loading && !sessionJobId ? "Đang chạy…" : "Chạy backtest (sync)"}
+          <button className="run" onClick={() => void run()} disabled={loading || loadingRun || !!sessionJobId}>
+            {loading && !sessionJobId ? "Đang chạy…" : loadingRun ? "Đang load run…" : "Chạy backtest (sync)"}
           </button>
           <button
             className="run"

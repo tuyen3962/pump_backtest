@@ -5,6 +5,7 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"net/http"
@@ -74,11 +75,13 @@ type jobPayload struct {
 
 // backtestHub owns shared pipeline + async jobs for the dashboard process.
 type backtestHub struct {
-	dataDir string
-	st      *store.Store
-	runner  *jobs.Runner
-	mu      sync.Mutex
-	pending map[string]jobPayload
+	dataDir       string
+	st            *store.Store
+	runner        *jobs.Runner
+	mu            sync.Mutex
+	pending       map[string]jobPayload
+	sessionMu     sync.Mutex
+	activeSession string // job id of running stability session
 }
 
 func newBacktestHub(dataDir string, st *store.Store) *backtestHub {
@@ -105,8 +108,23 @@ func (h *backtestHub) runJob(ctx context.Context, job *jobs.Job) error {
 	}()
 
 	req := p.Req
-	endAt, _ := parseRFC3339(req.SessionEndAt)
-	if endAt.IsZero() {
+	sessionEndRaw := strings.TrimSpace(req.SessionEndAt)
+	endAt, endErr := parseRFC3339(sessionEndRaw)
+	if sessionEndRaw != "" {
+		defer func() {
+			h.sessionMu.Lock()
+			if h.activeSession == job.ID {
+				h.activeSession = ""
+			}
+			h.sessionMu.Unlock()
+		}()
+		if endErr != nil || endAt.IsZero() {
+			return fmt.Errorf("invalid sessionEndAt %q: %w", sessionEndRaw, endErr)
+		}
+		if !endAt.After(time.Now().UTC()) {
+			return fmt.Errorf("sessionEndAt is in the past")
+		}
+	} else if endAt.IsZero() {
 		updateWatch := false
 		if req.UpdateWatchlist != nil {
 			updateWatch = *req.UpdateWatchlist
@@ -138,7 +156,10 @@ func (h *backtestHub) runJob(ctx context.Context, job *jobs.Job) error {
 		updateWatch = *req.UpdateWatchlist
 	}
 
-	for {
+	sessionCtx, sessionCancel := context.WithDeadline(ctx, endAt)
+	defer sessionCancel()
+
+	for tickN := 0; ; tickN++ {
 		if err := ctx.Err(); err != nil {
 			return err
 		}
@@ -152,15 +173,25 @@ func (h *backtestHub) runJob(ctx context.Context, job *jobs.Job) error {
 			tick.ToTime = now.Format(time.RFC3339)
 			tick.CloseOpenAtEnd = false
 		}
-		h.runner.SetProgress(job.ID, fmt.Sprintf("session → %s · tick %s · signals reload",
-			endAt.Local().Format("15:04"), now.Local().Format("15:04:05")))
+		phase := "tick"
+		if final {
+			phase = "final"
+		}
+		h.runner.SetProgress(job.ID, fmt.Sprintf("session %s → %s · %s %s",
+			phase, endAt.Local().Format("15:04"), now.Local().Format("15:04:05"),
+			map[bool]string{true: "(closing)", false: ""}[final]))
 
 		mode := persistSnapshot
 		if final {
 			mode = persistFull
 		}
-		out, err := h.execute(ctx, tick, p.ReqBytes, job.ID, updateWatch, mode)
+		out, err := h.execute(sessionCtx, tick, p.ReqBytes, job.ID, updateWatch, mode)
 		if err != nil {
+			if final && (errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled)) {
+				// Deadline hit mid-final — still treat as complete.
+				h.runner.SetProgress(job.ID, "session complete")
+				return nil
+			}
 			return err
 		}
 		job.RunID = out.RunID
@@ -172,20 +203,33 @@ func (h *backtestHub) runJob(ctx context.Context, job *jobs.Job) error {
 			h.runner.SetProgress(job.ID, "session complete")
 			return nil
 		}
+
+		// execute (enrich) may take minutes — re-check wall clock before sleeping.
+		now = time.Now().UTC()
+		if !now.Before(endAt) {
+			continue
+		}
 		sleep := time.Duration(refresh) * time.Second
-		if now.Add(sleep).After(endAt) {
-			sleep = time.Until(endAt)
-			if sleep < time.Second {
-				sleep = time.Second
-			}
+		if d := time.Until(endAt); d < sleep {
+			sleep = d
+		}
+		if sleep <= 0 {
+			continue
 		}
 		timer := time.NewTimer(sleep)
 		select {
 		case <-ctx.Done():
 			timer.Stop()
 			return ctx.Err()
+		case <-sessionCtx.Done():
+			timer.Stop()
+			if errors.Is(sessionCtx.Err(), context.DeadlineExceeded) {
+				continue // run final tick
+			}
+			return sessionCtx.Err()
 		case <-timer.C:
 		}
+		_ = tickN
 	}
 }
 
@@ -198,6 +242,23 @@ func (h *backtestHub) enqueue(req backtestRequest, reqBytes []byte) (*jobs.Job, 
 			req.Label = "run " + id
 		}
 	}
+
+	if strings.TrimSpace(req.SessionEndAt) != "" {
+		endAt, err := parseRFC3339(req.SessionEndAt)
+		if err != nil || endAt.IsZero() {
+			return nil, fmt.Errorf("invalid sessionEndAt: %w", err)
+		}
+		if !endAt.After(time.Now().UTC()) {
+			return nil, fmt.Errorf("sessionEndAt must be in the future")
+		}
+		h.sessionMu.Lock()
+		if prev := h.activeSession; prev != "" {
+			h.runner.Cancel(prev)
+		}
+		h.activeSession = id
+		h.sessionMu.Unlock()
+	}
+
 	h.mu.Lock()
 	h.pending[id] = jobPayload{ReqBytes: reqBytes, Req: req}
 	h.mu.Unlock()
@@ -206,6 +267,13 @@ func (h *backtestHub) enqueue(req backtestRequest, reqBytes []byte) (*jobs.Job, 
 		h.mu.Lock()
 		delete(h.pending, id)
 		h.mu.Unlock()
+		if strings.TrimSpace(req.SessionEndAt) != "" {
+			h.sessionMu.Lock()
+			if h.activeSession == id {
+				h.activeSession = ""
+			}
+			h.sessionMu.Unlock()
+		}
 		return nil, err
 	}
 	return job, nil
@@ -250,22 +318,38 @@ func (h *backtestHub) execute(ctx context.Context, req backtestRequest, reqBytes
 	if runID == "" {
 		runID = newRunID()
 	}
+
+	slimRes := res
+	slimRes.Trades = nil
+	slimRes.Equity = backtest.DownsampleEquity(res.Equity, 400)
+
 	payload := map[string]any{
-		"id":      runID,
-		"label":   req.Label,
-		"source":  path,
-		"loaded":  len(records),
-		"loadedAll": before,
-		"fromTime":  req.FromTime,
-		"toTime":    req.ToTime,
+		"id":           runID,
+		"label":        req.Label,
+		"source":       path,
+		"loaded":       len(records),
+		"loadedAll":    before,
+		"fromTime":     req.FromTime,
+		"toTime":       req.ToTime,
 		"sessionEndAt": req.SessionEndAt,
-		"result":  res,
-		"equity":  equityDTO(res),
-		"updated": time.Now().UTC().Format(time.RFC3339),
+		"result":       slimRes,
+		"equity":       equityDTO(slimRes),
+		"updated":      time.Now().UTC().Format(time.RFC3339),
 	}
 	respBytes, err := json.Marshal(payload)
 	if err != nil {
 		return nil, err
+	}
+
+	if tradesJSON, err := json.Marshal(res.Trades); err == nil {
+		if eqJSON, err := json.Marshal(res.Equity); err == nil {
+			if err := h.st.SaveRunDetail(runID, store.RunDetail{
+				Trades: tradesJSON,
+				Equity: eqJSON,
+			}); err != nil {
+				log.Printf("save run detail %s: %v", runID, err)
+			}
+		}
 	}
 
 	saved := store.SavedRun{
@@ -440,7 +524,7 @@ func persistHistoryAndWatch(st *store.Store, runID string, res backtest.Result) 
 	}
 }
 
-func resultFromSaved(run *store.SavedRun) (backtest.Result, map[string]any, error) {
+func resultFromSaved(run *store.SavedRun, st *store.Store) (backtest.Result, map[string]any, error) {
 	var payload map[string]any
 	if err := json.Unmarshal(run.Response, &payload); err != nil {
 		return backtest.Result{}, nil, err
@@ -457,7 +541,52 @@ func resultFromSaved(run *store.SavedRun) (backtest.Result, map[string]any, erro
 	if err := json.Unmarshal(b, &res); err != nil {
 		return backtest.Result{}, payload, err
 	}
+	if st != nil {
+		if detail, err := st.LoadRunDetail(run.ID); err == nil && detail != nil {
+			if len(detail.Trades) > 0 {
+				_ = json.Unmarshal(detail.Trades, &res.Trades)
+			}
+			if len(detail.Equity) > 0 {
+				var fullEq []backtest.EquityPoint
+				if json.Unmarshal(detail.Equity, &fullEq) == nil && len(fullEq) > 0 {
+					res.Equity = fullEq
+				}
+			}
+		}
+	}
 	return res, payload, nil
+}
+
+// slimRunPayloadForAPI strips heavy fields from legacy run blobs before sending to the UI.
+func slimRunPayloadForAPI(resp map[string]any) map[string]any {
+	if resp == nil {
+		return resp
+	}
+	raw, ok := resp["result"]
+	if !ok {
+		return resp
+	}
+	b, err := json.Marshal(raw)
+	if err != nil {
+		return resp
+	}
+	var res backtest.Result
+	if err := json.Unmarshal(b, &res); err != nil {
+		return resp
+	}
+	if len(res.Trades) > 0 {
+		res.Trades = nil
+	}
+	if len(res.Equity) > 400 {
+		res.Equity = backtest.DownsampleEquity(res.Equity, 400)
+	}
+	resp["result"] = res
+	if eq, ok := resp["equity"].([]any); ok && len(eq) > 400 {
+		resp["equity"] = equityDTO(res)
+	} else if eqSlice, ok := resp["equity"].([]map[string]any); ok && len(eqSlice) > 400 {
+		resp["equity"] = equityDTO(res)
+	}
+	return resp
 }
 
 func writeCSVDownload(w http.ResponseWriter, filename string, writeFn func(http.ResponseWriter) error) {
