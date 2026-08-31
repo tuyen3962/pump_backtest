@@ -457,8 +457,20 @@ func handleHistory(w http.ResponseWriter, r *http.Request, st *store.Store) {
 	if status != "" {
 		filtered := items[:0]
 		for _, it := range items {
-			if it.Status == status {
-				filtered = append(filtered, it)
+			rugged := store.IsRuggedTrade(it.ExitReason, it.RugScore, it.RugLabel)
+			switch status {
+			case "rugged":
+				if rugged {
+					filtered = append(filtered, it)
+				}
+			case "closed":
+				if !rugged {
+					filtered = append(filtered, it)
+				}
+			default:
+				if it.Status == status {
+					filtered = append(filtered, it)
+				}
 			}
 		}
 		items = filtered

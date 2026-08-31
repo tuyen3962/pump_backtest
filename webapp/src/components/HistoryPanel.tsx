@@ -3,6 +3,21 @@ import { fetchHistory, type HistoryEntry } from "../api";
 import { hold, pct, pnlClass, shortMint } from "../format";
 import { CopyMint } from "./CopyMint";
 
+function isRuggedEntry(c: HistoryEntry): boolean {
+  const low = (c.exitReason || "").toLowerCase();
+  if (
+    low.includes("whale_dump") ||
+    low.includes("dev_sold") ||
+    low.startsWith("out:must:")
+  ) {
+    return true;
+  }
+  if (low.startsWith("out:") && low.includes("stale")) return true;
+  const lbl = (c.rugLabel || "").toLowerCase();
+  if (lbl === "critical" || lbl === "high") return true;
+  return (c.rugScore || 0) >= 70;
+}
+
 export function HistoryPanel() {
   const [items, setItems] = useState<HistoryEntry[]>([]);
   const [filter, setFilter] = useState<"" | "closed" | "rugged">("");
@@ -72,7 +87,9 @@ export function HistoryPanel() {
             <tbody>
               {items.map((c) => {
                 const cls = pnlClass(c.returnPct);
-                const statusCls = c.status === "rugged" ? "down" : "";
+                const rugged = isRuggedEntry(c);
+                const statusCls = rugged ? "down" : "";
+                const statusLabel = rugged ? "rugged" : "closed";
                 return (
                   <tr key={c.id || `${c.mint}-${c.closedAt}-${c.exitReason}-${c.holdSec}`}>
                     <td>
@@ -85,7 +102,7 @@ export function HistoryPanel() {
                       </div>
                     </td>
                     <td>
-                      <span className={`pill ${statusCls}`}>{c.status}</span>
+                      <span className={`pill ${statusCls}`}>{statusLabel}</span>
                       {c.rugLabel ? <div className="mint">{c.rugLabel}</div> : null}
                     </td>
                     <td className="mono">

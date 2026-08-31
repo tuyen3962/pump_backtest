@@ -459,14 +459,30 @@ func (s *Store) ReplaceSourceWatches(source string, next []WatchItem) ([]WatchIt
 	return out, nil
 }
 
+// IsRuggedTrade reports whether a closed leg should appear under the rugged filter.
+func IsRuggedTrade(exitReason string, rugScore float64, rugLabel string) bool {
+	low := strings.ToLower(strings.TrimSpace(exitReason))
+	switch {
+	case strings.Contains(low, "whale_dump"),
+		strings.Contains(low, "dev_sold"),
+		strings.HasPrefix(low, "out:must:"):
+		return true
+	case strings.HasPrefix(low, "out:") && strings.Contains(low, "stale"):
+		return true
+	}
+	switch strings.ToLower(strings.TrimSpace(rugLabel)) {
+	case "critical", "high":
+		return true
+	}
+	return rugScore >= 70
+}
+
 // ClassifyStatus maps exit reason / rug metrics to history status.
-func ClassifyStatus(exitReason string, rugScore float64, open bool) string {
+func ClassifyStatus(exitReason string, rugScore float64, rugLabel string, open bool) string {
 	if open {
 		return "open_saved"
 	}
-	low := strings.ToLower(exitReason)
-	if strings.Contains(low, "whale_dump") || strings.Contains(low, "dev_sold") ||
-		strings.Contains(low, "stop_loss") || rugScore >= 70 {
+	if IsRuggedTrade(exitReason, rugScore, rugLabel) {
 		return "rugged"
 	}
 	return "closed"

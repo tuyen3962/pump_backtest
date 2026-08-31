@@ -371,14 +371,14 @@ func persistHistoryOnly(st *store.Store, runID string, res backtest.Result) {
 		if t.Open {
 			continue
 		}
-		status := store.ClassifyStatus(t.ExitReason, 0, false)
+		status := store.ClassifyStatus(t.ExitReason, 0, "", false)
 		var rugScore float64
 		var rugLabel string
 		for _, c := range res.Coins {
 			if c.Mint == t.Mint {
 				rugScore = c.RugScore
 				rugLabel = c.RugLabel
-				status = store.ClassifyStatus(t.ExitReason, rugScore, false)
+				status = store.ClassifyStatus(t.ExitReason, rugScore, rugLabel, false)
 				break
 			}
 		}
